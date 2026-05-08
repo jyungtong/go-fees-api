@@ -7,9 +7,13 @@
   - `bill/migrations/` created
   - Git history restored, pushed to `origin main`
   - Commit: `chore: scaffold Encore project`
+- [x] Step 2: DB migration (`bill/migrations/1_create_tables.up.sql`)
+  - Two tables: `bills` + `line_items`
+  - BIGINT for monetary amounts (cents/tetri)
+  - CHECK constraints on status, currency, quantity, unit_price
+  - Index on `line_items.bill_id`
 
 ## In Progress
-- [ ] Step 2: DB migration (`bill/migrations/1_create_tables.up.sql`)
 - [ ] Step 3: Service struct + Temporal worker (`bill/service.go`)
 - [ ] Step 4: Temporal activities (`bill/activities.go`)
 - [ ] Step 5: Temporal workflow (`bill/workflow.go`)
