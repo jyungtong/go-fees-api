@@ -22,15 +22,18 @@
   - `GET /health` — returns `{status, temporal_reachable}`
   - Uses `client.CheckHealthRequest` to verify Temporal connectivity
   - Verified: `encore run` compiles, Docker PG starts, health endpoint responds
-
-## In Progress
 - [x] Step 4: Temporal activities (`bill/activities.go`)
   - CreateBillActivity — INSERT bills row with workflow ID
   - AddLineItemActivity — FOR UPDATE check + INSERT line item
   - CloseBillActivity — FOR UPDATE + SUM amounts + SET closed
   - All monetary values int64 (BIGINT — cents/tetri)
   - Shared types: BillParams, LineItemSignal, LineItemRecord, results
-- [ ] Step 5: Temporal workflow (`bill/workflow.go`)
+- [x] Step 5: Temporal workflow (`bill/workflow.go`)
+  - BillWorkflow: CreateBillActivity → selector loop (AddLineItem/CloseBill) → CloseBillActivity
+  - Workflow + activities registered to worker in initService()
+  - Worker started on taskQueue "bill-task-queue"
+
+## In Progress
 - [ ] Step 6: API endpoints (`bill/bill.go`)
 - [ ] Verify: full integration test
 
