@@ -24,7 +24,20 @@
   - Verified: `encore run` compiles, Docker PG starts, health endpoint responds
 
 ## In Progress
-- [ ] Step 4: Temporal activities (`bill/activities.go`)
+- [x] Step 4: Temporal activities (`bill/activities.go`)
+  - CreateBillActivity — INSERT bills row with workflow ID
+  - AddLineItemActivity — FOR UPDATE check + INSERT line item
+  - CloseBillActivity — FOR UPDATE + SUM amounts + SET closed
+  - All monetary values int64 (BIGINT — cents/tetri)
+  - Shared types: BillParams, LineItemSignal, LineItemRecord, results
 - [ ] Step 5: Temporal workflow (`bill/workflow.go`)
 - [ ] Step 6: API endpoints (`bill/bill.go`)
 - [ ] Verify: full integration test
+
+## Future Improvements
+
+### Activity Idempotency (Production Hardening)
+Temporal retries activities on timeout. Risk of duplicate inserts on retry:
+- CreateBillActivity: `INSERT ... ON CONFLICT (id) DO NOTHING`
+- AddLineItemActivity: Same `ON CONFLICT` on signal.ID
+- CloseBillActivity: `UPDATE ... WHERE status = 'open'` + check `RowsAffected`; if 0, query existing total instead of erroring
