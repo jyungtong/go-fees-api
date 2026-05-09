@@ -1,0 +1,302 @@
+package bill
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"encore.dev/beta/errs"
+	"github.com/google/uuid"
+	"go.temporal.io/sdk/client"
+)
+
+type CreateBillRequest struct {
+	Currency   string `json:"currency"`
+	CustomerID string `json:"customer_id,omitempty"`
+}
+
+type CreateBillResponse struct {
+	ID         string    `json:"id"`
+	Status     string    `json:"status"`
+	Currency   string    `json:"currency"`
+	WorkflowID string    `json:"workflow_id"`
+	CreatedAt  time.Time `json:"created_at"`
+}
+
+type AddLineItemRequest struct {
+	Description string `json:"description"`
+	Quantity    int    `json:"quantity"`
+	UnitPrice   int64  `json:"unit_price"`
+}
+
+type AddLineItemResponse struct {
+	ID          string    `json:"id"`
+	BillID      string    `json:"bill_id"`
+	Description string    `json:"description"`
+	Quantity    int       `json:"quantity"`
+	UnitPrice   int64     `json:"unit_price"`
+	Amount      int64     `json:"amount"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type LineItemResponse struct {
+	ID          string    `json:"id"`
+	Description string    `json:"description"`
+	Quantity    int       `json:"quantity"`
+	UnitPrice   int64     `json:"unit_price"`
+	Amount      int64     `json:"amount"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+type CloseBillResponse struct {
+	ID        string             `json:"id"`
+	Status    string             `json:"status"`
+	Currency  string             `json:"currency"`
+	Total     int64              `json:"total"`
+	LineItems []LineItemResponse `json:"line_items"`
+	ClosedAt  time.Time          `json:"closed_at"`
+}
+
+type BillResponse struct {
+	ID         string             `json:"id"`
+	Status     string             `json:"status"`
+	Currency   string             `json:"currency"`
+	CustomerID string             `json:"customer_id,omitempty"`
+	Total      *int64             `json:"total,omitempty"`
+	LineItems  []LineItemResponse `json:"line_items"`
+	CreatedAt  time.Time          `json:"created_at"`
+	ClosedAt   *time.Time         `json:"closed_at,omitempty"`
+}
+
+type ListBillsResponse struct {
+	Bills []BillSummary `json:"bills"`
+}
+
+type BillSummary struct {
+	ID        string     `json:"id"`
+	Status    string     `json:"status"`
+	Currency  string     `json:"currency"`
+	Total     *int64     `json:"total,omitempty"`
+	CreatedAt time.Time  `json:"created_at"`
+	ClosedAt  *time.Time `json:"closed_at,omitempty"`
+}
+
+//encore:api public method=POST path=/bills
+func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*CreateBillResponse, error) {
+	if req.Currency != "USD" && req.Currency != "GEL" {
+		return nil, errs.WrapCode(errors.New("currency must be USD or GEL"), errs.InvalidArgument, "invalid_currency")
+	}
+
+	billID := uuid.NewString()
+	createdAt := time.Now()
+
+	params := BillParams{
+		BillID:     billID,
+		Currency:   req.Currency,
+		CustomerID: req.CustomerID,
+		CreatedAt:  createdAt,
+	}
+
+	workflowOptions := client.StartWorkflowOptions{
+		ID:        billID,
+		TaskQueue: taskQueue,
+	}
+
+	_, err := s.temporalClient.ExecuteWorkflow(ctx, workflowOptions, BillWorkflow, params)
+	if err != nil {
+		return nil, err
+	}
+
+	return &CreateBillResponse{
+		ID:         billID,
+		Status:     "open",
+		Currency:   req.Currency,
+		WorkflowID: billID,
+		CreatedAt:  createdAt,
+	}, nil
+}
+
+//encore:api public method=POST path=/bills/:id/line-items
+func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
+	if req.Quantity <= 0 {
+		return nil, errs.WrapCode(errors.New("quantity must be greater than 0"), errs.InvalidArgument, "invalid_quantity")
+	}
+	if req.UnitPrice <= 0 {
+		return nil, errs.WrapCode(errors.New("unit_price must be greater than 0"), errs.InvalidArgument, "invalid_unit_price")
+	}
+
+	var status string
+	err := db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
+	if err != nil {
+		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
+	}
+	if status != "open" {
+		return nil, errs.WrapCode(errors.New("bill is already closed"), errs.Aborted, "bill_closed")
+	}
+
+	itemID := uuid.NewString()
+	signal := LineItemSignal{
+		ID:          itemID,
+		Description: req.Description,
+		Quantity:    req.Quantity,
+		UnitPrice:   req.UnitPrice,
+	}
+
+	err = s.temporalClient.SignalWorkflow(ctx, id, "", "AddLineItem", signal)
+	if err != nil {
+		return nil, err
+	}
+
+	return &AddLineItemResponse{
+		ID:          itemID,
+		BillID:      id,
+		Description: req.Description,
+		Quantity:    req.Quantity,
+		UnitPrice:   req.UnitPrice,
+		Amount:      int64(req.Quantity) * req.UnitPrice,
+		CreatedAt:   time.Now(),
+	}, nil
+}
+
+//encore:api public method=POST path=/bills/:id/close
+func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
+	var status string
+	err := db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
+	if err != nil {
+		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
+	}
+	if status != "open" {
+		return nil, errs.WrapCode(errors.New("bill is already closed"), errs.Aborted, "bill_closed")
+	}
+
+	err = s.temporalClient.SignalWorkflow(ctx, id, "", "CloseBill", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	run := s.temporalClient.GetWorkflow(ctx, id, "")
+	var result CloseBillResult
+	err = run.Get(ctx, &result)
+	if err != nil {
+		return nil, err
+	}
+
+	var bill struct {
+		Currency   string
+		Total      *int64
+		ClosedAt   time.Time
+	}
+	err = db.QueryRow(ctx, `
+		SELECT currency, total_amount, closed_at
+		FROM bills WHERE id = $1
+	`, id).Scan(&bill.Currency, &bill.Total, &bill.ClosedAt)
+	if err != nil {
+		return nil, err
+	}
+
+	rows, err := db.Query(ctx, `
+		SELECT id, description, quantity, unit_price, created_at
+		FROM line_items WHERE bill_id = $1
+		ORDER BY created_at
+	`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var lineItems []LineItemResponse
+	for rows.Next() {
+		var item LineItemResponse
+		err := rows.Scan(&item.ID, &item.Description, &item.Quantity, &item.UnitPrice, &item.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		item.Amount = int64(item.Quantity) * item.UnitPrice
+		lineItems = append(lineItems, item)
+	}
+
+	return &CloseBillResponse{
+		ID:        id,
+		Status:    "closed",
+		Currency:  bill.Currency,
+		Total:     *bill.Total,
+		LineItems: lineItems,
+		ClosedAt:  bill.ClosedAt,
+	}, nil
+}
+
+//encore:api public method=GET path=/bills/:id
+func (s *Service) GetBill(ctx context.Context, id string) (*BillResponse, error) {
+	var bill struct {
+		Status     string
+		Currency   string
+		CustomerID *string
+		Total      *int64
+		CreatedAt  time.Time
+		ClosedAt   *time.Time
+	}
+	err := db.QueryRow(ctx, `
+		SELECT status, currency, customer_id, total_amount, created_at, closed_at
+		FROM bills WHERE id = $1
+	`, id).Scan(&bill.Status, &bill.Currency, &bill.CustomerID, &bill.Total, &bill.CreatedAt, &bill.ClosedAt)
+	if err != nil {
+		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
+	}
+
+	rows, err := db.Query(ctx, `
+		SELECT id, description, quantity, unit_price, created_at
+		FROM line_items WHERE bill_id = $1
+		ORDER BY created_at
+	`, id)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var lineItems []LineItemResponse
+	for rows.Next() {
+		var item LineItemResponse
+		err := rows.Scan(&item.ID, &item.Description, &item.Quantity, &item.UnitPrice, &item.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		item.Amount = int64(item.Quantity) * item.UnitPrice
+		lineItems = append(lineItems, item)
+	}
+
+	return &BillResponse{
+		ID:         id,
+		Status:     bill.Status,
+		Currency:   bill.Currency,
+		CustomerID: func() string { if bill.CustomerID != nil { return *bill.CustomerID }; return "" }(),
+		Total:      bill.Total,
+		LineItems:  lineItems,
+		CreatedAt:  bill.CreatedAt,
+		ClosedAt:   bill.ClosedAt,
+	}, nil
+}
+
+//encore:api public method=GET path=/bills
+func (s *Service) ListBills(ctx context.Context) (*ListBillsResponse, error) {
+	rows, err := db.Query(ctx, `
+		SELECT id, status, currency, total_amount, created_at, closed_at
+		FROM bills
+		ORDER BY created_at DESC
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var bills []BillSummary
+	for rows.Next() {
+		var bill BillSummary
+		err := rows.Scan(&bill.ID, &bill.Status, &bill.Currency, &bill.Total, &bill.CreatedAt, &bill.ClosedAt)
+		if err != nil {
+			return nil, err
+		}
+		bills = append(bills, bill)
+	}
+
+	return &ListBillsResponse{Bills: bills}, nil
+}

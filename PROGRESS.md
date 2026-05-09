@@ -32,9 +32,13 @@
   - BillWorkflow: CreateBillActivity → selector loop (AddLineItem/CloseBill) → CloseBillActivity
   - Workflow + activities registered to worker in initService()
   - Worker started on taskQueue "bill-task-queue"
+- [x] Step 6: API endpoints (`bill/bill.go`)
+  - Added `CreatedAt` to `BillParams` and `CreateBillActivity` (DB as source of truth)
+  - Implemented 5 endpoints: CreateBill, AddLineItem, CloseBill, GetBill, ListBills
+  - Layer 1 status checks for 409 handling
+  - CloseBill blocks until workflow completes
 
 ## In Progress
-- [ ] Step 6: API endpoints (`bill/bill.go`)
 - [ ] Verify: full integration test
 
 ## Future Improvements

@@ -12,6 +12,7 @@ type BillParams struct {
 	BillID     string
 	Currency   string
 	CustomerID string
+	CreatedAt  time.Time
 }
 
 type LineItemSignal struct {
@@ -42,9 +43,9 @@ func CreateBillActivity(ctx context.Context, params BillParams) (*CreateBillResu
 	info := activity.GetInfo(ctx)
 
 	_, err := db.Exec(ctx, `
-		INSERT INTO bills (id, status, currency, customer_id, workflow_id)
-		VALUES ($1, 'open', $2, $3, $4)
-	`, params.BillID, params.Currency, params.CustomerID, info.WorkflowExecution.ID)
+		INSERT INTO bills (id, status, currency, customer_id, workflow_id, created_at)
+		VALUES ($1, 'open', $2, $3, $4, $5)
+	`, params.BillID, params.Currency, params.CustomerID, info.WorkflowExecution.ID, params.CreatedAt)
 	if err != nil {
 		return nil, fmt.Errorf("insert bill: %w", err)
 	}
