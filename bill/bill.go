@@ -26,7 +26,7 @@ type CreateBillResponse struct {
 type AddLineItemRequest struct {
 	Description string `json:"description"`
 	Quantity    int    `json:"quantity"`
-	UnitPrice   int64  `json:"unit_price"`
+	UnitPrice   string `json:"unit_price"`
 }
 
 type AddLineItemResponse struct {
@@ -34,8 +34,8 @@ type AddLineItemResponse struct {
 	BillID      string    `json:"bill_id"`
 	Description string    `json:"description"`
 	Quantity    int       `json:"quantity"`
-	UnitPrice   int64     `json:"unit_price"`
-	Amount      int64     `json:"amount"`
+	UnitPrice   string    `json:"unit_price"`
+	Amount      string    `json:"amount"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -43,8 +43,8 @@ type LineItemResponse struct {
 	ID          string    `json:"id"`
 	Description string    `json:"description"`
 	Quantity    int       `json:"quantity"`
-	UnitPrice   int64     `json:"unit_price"`
-	Amount      int64     `json:"amount"`
+	UnitPrice   string    `json:"unit_price"`
+	Amount      string    `json:"amount"`
 	CreatedAt   time.Time `json:"created_at"`
 }
 
@@ -52,7 +52,7 @@ type CloseBillResponse struct {
 	ID        string             `json:"id"`
 	Status    string             `json:"status"`
 	Currency  string             `json:"currency"`
-	Total     int64              `json:"total"`
+	Total     string             `json:"total"`
 	LineItems []LineItemResponse `json:"line_items"`
 	ClosedAt  time.Time          `json:"closed_at"`
 }
@@ -62,7 +62,7 @@ type BillResponse struct {
 	Status     string             `json:"status"`
 	Currency   string             `json:"currency"`
 	CustomerID string             `json:"customer_id,omitempty"`
-	Total      *int64             `json:"total,omitempty"`
+	Total      *string            `json:"total,omitempty"`
 	LineItems  []LineItemResponse `json:"line_items"`
 	CreatedAt  time.Time          `json:"created_at"`
 	ClosedAt   *time.Time         `json:"closed_at,omitempty"`
@@ -76,7 +76,7 @@ type BillSummary struct {
 	ID        string     `json:"id"`
 	Status    string     `json:"status"`
 	Currency  string     `json:"currency"`
-	Total     *int64     `json:"total,omitempty"`
+	Total     *string    `json:"total,omitempty"`
 	CreatedAt time.Time  `json:"created_at"`
 	ClosedAt  *time.Time `json:"closed_at,omitempty"`
 }
@@ -121,12 +121,13 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 	if req.Quantity <= 0 {
 		return nil, errs.WrapCode(errors.New("quantity must be greater than 0"), errs.InvalidArgument, "invalid_quantity")
 	}
-	if req.UnitPrice <= 0 {
-		return nil, errs.WrapCode(errors.New("unit_price must be greater than 0"), errs.InvalidArgument, "invalid_unit_price")
+	unitPriceMinor, err := parseMoneyAmount(req.UnitPrice)
+	if err != nil {
+		return nil, errs.WrapCode(err, errs.InvalidArgument, "invalid_unit_price")
 	}
 
 	var status string
-	err := db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
+	err = db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
 	if err != nil {
 		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
 	}
@@ -139,7 +140,7 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 		ID:          itemID,
 		Description: req.Description,
 		Quantity:    req.Quantity,
-		UnitPrice:   req.UnitPrice,
+		UnitPrice:   unitPriceMinor,
 	}
 
 	err = s.temporalClient.SignalWorkflow(ctx, id, "", "AddLineItem", signal)
@@ -152,8 +153,8 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 		BillID:      id,
 		Description: req.Description,
 		Quantity:    req.Quantity,
-		UnitPrice:   req.UnitPrice,
-		Amount:      int64(req.Quantity) * req.UnitPrice,
+		UnitPrice:   formatMoneyAmount(unitPriceMinor),
+		Amount:      formatMoneyAmount(int64(req.Quantity) * unitPriceMinor),
 		CreatedAt:   time.Now(),
 	}, nil
 }
@@ -182,9 +183,9 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 	}
 
 	var bill struct {
-		Currency   string
-		Total      *int64
-		ClosedAt   time.Time
+		Currency string
+		Total    *int64
+		ClosedAt time.Time
 	}
 	err = db.QueryRow(ctx, `
 		SELECT currency, total_amount, closed_at
@@ -207,11 +208,13 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 	var lineItems []LineItemResponse
 	for rows.Next() {
 		var item LineItemResponse
-		err := rows.Scan(&item.ID, &item.Description, &item.Quantity, &item.UnitPrice, &item.CreatedAt)
+		var unitPriceMinor int64
+		err := rows.Scan(&item.ID, &item.Description, &item.Quantity, &unitPriceMinor, &item.CreatedAt)
 		if err != nil {
 			return nil, err
 		}
-		item.Amount = int64(item.Quantity) * item.UnitPrice
+		item.UnitPrice = formatMoneyAmount(unitPriceMinor)
+		item.Amount = formatMoneyAmount(int64(item.Quantity) * unitPriceMinor)
 		lineItems = append(lineItems, item)
 	}
 
@@ -219,7 +222,7 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 		ID:        id,
 		Status:    "closed",
 		Currency:  bill.Currency,
-		Total:     *bill.Total,
+		Total:     formatMoneyAmount(*bill.Total),
 		LineItems: lineItems,
 		ClosedAt:  bill.ClosedAt,
 	}, nil
@@ -256,23 +259,30 @@ func (s *Service) GetBill(ctx context.Context, id string) (*BillResponse, error)
 	var lineItems []LineItemResponse
 	for rows.Next() {
 		var item LineItemResponse
-		err := rows.Scan(&item.ID, &item.Description, &item.Quantity, &item.UnitPrice, &item.CreatedAt)
+		var unitPriceMinor int64
+		err := rows.Scan(&item.ID, &item.Description, &item.Quantity, &unitPriceMinor, &item.CreatedAt)
 		if err != nil {
 			return nil, err
 		}
-		item.Amount = int64(item.Quantity) * item.UnitPrice
+		item.UnitPrice = formatMoneyAmount(unitPriceMinor)
+		item.Amount = formatMoneyAmount(int64(item.Quantity) * unitPriceMinor)
 		lineItems = append(lineItems, item)
 	}
 
 	return &BillResponse{
-		ID:         id,
-		Status:     bill.Status,
-		Currency:   bill.Currency,
-		CustomerID: func() string { if bill.CustomerID != nil { return *bill.CustomerID }; return "" }(),
-		Total:      bill.Total,
-		LineItems:  lineItems,
-		CreatedAt:  bill.CreatedAt,
-		ClosedAt:   bill.ClosedAt,
+		ID:       id,
+		Status:   bill.Status,
+		Currency: bill.Currency,
+		CustomerID: func() string {
+			if bill.CustomerID != nil {
+				return *bill.CustomerID
+			}
+			return ""
+		}(),
+		Total:     formatOptionalMoneyAmount(bill.Total),
+		LineItems: lineItems,
+		CreatedAt: bill.CreatedAt,
+		ClosedAt:  bill.ClosedAt,
 	}, nil
 }
 
@@ -290,12 +300,26 @@ func (s *Service) ListBills(ctx context.Context) (*ListBillsResponse, error) {
 
 	var bills []BillSummary
 	for rows.Next() {
-		var bill BillSummary
+		var bill struct {
+			ID        string
+			Status    string
+			Currency  string
+			Total     *int64
+			CreatedAt time.Time
+			ClosedAt  *time.Time
+		}
 		err := rows.Scan(&bill.ID, &bill.Status, &bill.Currency, &bill.Total, &bill.CreatedAt, &bill.ClosedAt)
 		if err != nil {
 			return nil, err
 		}
-		bills = append(bills, bill)
+		bills = append(bills, BillSummary{
+			ID:        bill.ID,
+			Status:    bill.Status,
+			Currency:  bill.Currency,
+			Total:     formatOptionalMoneyAmount(bill.Total),
+			CreatedAt: bill.CreatedAt,
+			ClosedAt:  bill.ClosedAt,
+		})
 	}
 
 	return &ListBillsResponse{Bills: bills}, nil

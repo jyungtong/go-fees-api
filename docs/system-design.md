@@ -53,8 +53,8 @@ POST /bills
   ← { "id", "status": "open", "currency", "workflow_id", "created_at" }
 
 POST /bills/:id/line-items
-  → { "description": "broccoli", "quantity": 1, "unit_price": 350 }
-      // unit_price in minor units: 350 = $3.50
+  → { "description": "broccoli", "quantity": 1, "unit_price": "3.50" }
+      // unit_price is a decimal string in major units
   ← { "id", "bill_id", "description", "quantity", "unit_price", "amount", "created_at" }
 
 POST /bills/:id/close
@@ -138,10 +138,13 @@ GET /bills
 
 - Currency set at bill creation: `CHECK (currency IN ('USD', 'GEL'))`
 - All line items on a bill are denominated in that bill's currency
-- All monetary amounts stored as `BIGINT` in minor units:
+- API monetary amounts are decimal strings in major units:
+  - `unit_price` = `"3.50"`
+  - `amount` in response = `quantity * unit_price`, formatted as `"3.50"`
+  - `total` in response = final bill total, formatted as `"3.50"`
+- Database monetary amounts are stored as `BIGINT` in minor units:
   - `unit_price` = cents (USD) or tetri (GEL) — `350` = $3.50 or ₾3.50
   - `total_amount` = sum in minor units
-  - `amount` in response = `quantity * unit_price`
 - Integer math for totals — `SUM(quantity * unit_price)` — no floating-point, no precision drift
 
 ---
@@ -151,7 +154,7 @@ GET /bills
 | Scenario | HTTP Code |
 |----------|-----------|
 | Invalid currency (not USD/GEL) | 400 Bad Request |
-| Quantity or unit_price ≤ 0 | 400 Bad Request |
+| Quantity ≤ 0 or invalid/non-positive unit_price | 400 Bad Request |
 | Bill not found | 404 Not Found |
 | Add item to closed bill | 409 Conflict |
 | Close already-closed bill | 409 Conflict |
