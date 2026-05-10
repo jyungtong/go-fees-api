@@ -3,6 +3,7 @@ package bill
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"encore.dev/storage/sqldb"
 	"go.temporal.io/sdk/client"
@@ -22,8 +23,13 @@ type Service struct {
 }
 
 func initService() (*Service, error) {
+	hostPort := os.Getenv("TEMPORAL_HOST_PORT")
+	if hostPort == "" {
+		hostPort = "localhost:7233"
+	}
+
 	c, err := client.Dial(client.Options{
-		HostPort: "localhost:7233",
+		HostPort: hostPort,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create temporal client: %w", err)
