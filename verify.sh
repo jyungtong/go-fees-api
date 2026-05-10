@@ -2,6 +2,8 @@
 set -u
 
 BASE_URL="${BASE_URL:-http://localhost:4000}"
+CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-2}"
+CURL_MAX_TIME="${CURL_MAX_TIME:-15}"
 
 PASS=0
 FAIL=0
@@ -52,15 +54,17 @@ request() {
   tmp_code="$(mktemp)"
 
   if [[ -n "$data" ]]; then
-    curl -sS -o "$tmp_body" -w "%{http_code}" \
+    curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+      -o "$tmp_body" -w "%{http_code}" \
       -X "$method" \
       -H "Content-Type: application/json" \
       -d "$data" \
-      "$BASE_URL$path" >"$tmp_code"
+      "$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
   else
-    curl -sS -o "$tmp_body" -w "%{http_code}" \
+    curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+      -o "$tmp_body" -w "%{http_code}" \
       -X "$method" \
-      "$BASE_URL$path" >"$tmp_code"
+      "$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
   fi
 }
 
@@ -148,6 +152,26 @@ wait_for_bill() {
   return 1
 }
 
+wait_for_line_items() {
+  local id="$1"
+  local expected="$2"
+  local label="$3"
+  local attempts=30
+  local delay=0.2
+
+  for _ in $(seq 1 "$attempts"); do
+    request GET "/bills/$id"
+    if [[ "$(status_code)" == "200" && "$(json_field '.line_items | length')" == "$expected" ]]; then
+      log_pass "$label"
+      return 0
+    fi
+    sleep "$delay"
+  done
+
+  log_fail "$label" "bill $id did not reach $expected line items after ${attempts} attempts; last status $(status_code); body: $(body)"
+  return 1
+}
+
 print_section() {
   printf "\n%b%s%b\n" "$yellow" "$1" "$reset"
 }
@@ -174,7 +198,7 @@ if [[ "$usd_id" == "$usd_workflow_id" ]]; then
 else
   log_fail "workflow_id matches bill id" "id=$usd_id workflow_id=$usd_workflow_id"
 fi
-wait_for_bill "$usd_id" "USD bill persisted"
+wait_for_bill "$usd_id" "USD bill persisted" || exit 1
 
 request POST "/bills/$usd_id/line-items" '{"description":"widget","quantity":2,"unit_price":"3.50"}'
 assert_status 200 "add USD line item 1 returns 200"
@@ -187,6 +211,8 @@ assert_json_eq '.amount' '10.00' "USD line item 2 amount"
 request POST "/bills/$usd_id/line-items" '{"description":"service","quantity":3,"unit_price":"5.00"}'
 assert_status 200 "add USD line item 3 returns 200"
 assert_json_eq '.amount' '15.00' "USD line item 3 amount"
+
+wait_for_line_items "$usd_id" 3 "USD line items persisted" || exit 1
 
 request POST "/bills/$usd_id/close"
 assert_status 200 "close USD bill returns 200"
@@ -210,7 +236,7 @@ request POST "/bills" '{"currency":"GEL"}'
 assert_status 200 "create GEL bill returns 200"
 assert_json_eq '.currency' 'GEL' "GEL bill currency set"
 gel_id="$(json_field '.id')"
-wait_for_bill "$gel_id" "GEL bill persisted"
+wait_for_bill "$gel_id" "GEL bill persisted" || exit 1
 
 request POST "/bills/$gel_id/line-items" '{"description":"khachapuri","quantity":1,"unit_price":"1.00"}'
 assert_status 200 "add GEL line item 1 returns 200"
@@ -219,6 +245,8 @@ assert_json_eq '.amount' '1.00' "GEL line item 1 amount"
 request POST "/bills/$gel_id/line-items" '{"description":"lobiani","quantity":1,"unit_price":"2.00"}'
 assert_status 200 "add GEL line item 2 returns 200"
 assert_json_eq '.amount' '2.00' "GEL line item 2 amount"
+
+wait_for_line_items "$gel_id" 2 "GEL line items persisted" || exit 1
 
 request POST "/bills/$gel_id/close"
 assert_status 200 "close GEL bill returns 200"
@@ -235,7 +263,7 @@ assert_status 400 "empty currency returns 400"
 request POST "/bills" '{"currency":"USD"}'
 assert_status 200 "create validation target bill returns 200"
 validation_id="$(json_field '.id')"
-wait_for_bill "$validation_id" "validation target bill persisted"
+wait_for_bill "$validation_id" "validation target bill persisted" || exit 1
 
 request POST "/bills/$validation_id/line-items" '{"description":"bad","quantity":0,"unit_price":"1.00"}'
 assert_status 400 "zero quantity returns 400"
@@ -271,7 +299,7 @@ print_section "Phase 5: Edge Cases"
 request POST "/bills" '{"currency":"USD"}'
 assert_status 200 "create zero-item bill returns 200"
 zero_id="$(json_field '.id')"
-wait_for_bill "$zero_id" "zero-item bill persisted"
+wait_for_bill "$zero_id" "zero-item bill persisted" || exit 1
 
 request POST "/bills/$zero_id/close"
 assert_status 200 "close zero-item bill returns 200"
@@ -281,11 +309,13 @@ assert_json_eq '.line_items | length' '0' "zero-item bill has no line items"
 request POST "/bills" '{"currency":"USD"}'
 assert_status 200 "create large-value bill returns 200"
 large_id="$(json_field '.id')"
-wait_for_bill "$large_id" "large-value bill persisted"
+wait_for_bill "$large_id" "large-value bill persisted" || exit 1
 
 request POST "/bills/$large_id/line-items" '{"description":"large","quantity":999,"unit_price":"9999999.99"}'
 assert_status 200 "add large-value line item returns 200"
 assert_json_eq '.amount' '9989999990.01' "large-value item amount"
+
+wait_for_line_items "$large_id" 1 "large-value line item persisted" || exit 1
 
 request POST "/bills/$large_id/close"
 assert_status 200 "close large-value bill returns 200"
@@ -294,10 +324,12 @@ assert_json_eq '.total' '9989999990.01' "large-value bill total"
 request POST "/bills" '{"currency":"USD"}'
 assert_status 200 "create open-bill inspection target returns 200"
 open_id="$(json_field '.id')"
-wait_for_bill "$open_id" "open-bill inspection target persisted"
+wait_for_bill "$open_id" "open-bill inspection target persisted" || exit 1
 
 request POST "/bills/$open_id/line-items" '{"description":"open-item","quantity":1,"unit_price":"1.23"}'
 assert_status 200 "add item to open-bill inspection target returns 200"
+
+wait_for_line_items "$open_id" 1 "open-bill inspection item persisted" || exit 1
 
 request GET "/bills/$open_id"
 assert_status 200 "get open bill returns 200"

@@ -43,14 +43,11 @@
   - Uses real Temporal client/worker path; requires Temporal dev server for full execution
   - Skips integration tests when local Encore test DB lacks `CREATEDB` permission
   - Added root `doc.go` so `encore test` works from repo root
+- [x] Step 8: Activity idempotency hardening
+  - `CreateBillActivity` uses `ON CONFLICT (id) DO NOTHING`
+  - `AddLineItemActivity` treats same item replay as success and rejects mismatched duplicate IDs
+  - `CloseBillActivity` returns stored total on replay after close
+  - Added focused activity retry tests
 
 ## In Progress
 - [ ] Verify: full integration test with Temporal running and Encore test DB permissions
-
-## Future Improvements
-
-### Activity Idempotency (Production Hardening)
-Temporal retries activities on timeout. Risk of duplicate inserts on retry:
-- CreateBillActivity: `INSERT ... ON CONFLICT (id) DO NOTHING`
-- AddLineItemActivity: Same `ON CONFLICT` on signal.ID
-- CloseBillActivity: `UPDATE ... WHERE status = 'open'` + check `RowsAffected`; if 0, query existing total instead of erroring

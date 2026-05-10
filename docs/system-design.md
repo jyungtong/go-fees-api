@@ -126,6 +126,14 @@ GET /bills
 | `AddLineItemActivity` | INSERT into `line_items` (inside TX with status check) |
 | `CloseBillActivity` | `SELECT SUM` + `UPDATE bills SET status=closed` (inside TX) |
 
+### Activity Idempotency
+
+Temporal may retry activities after timeout or worker failure. Activities are safe to rerun:
+
+- `CreateBillActivity`: `INSERT ... ON CONFLICT (id) DO NOTHING`; existing bill ID returns success.
+- `AddLineItemActivity`: first checks `line_items.id`. If same bill/payload already exists, returns success even if bill is now closed. If not present, locks bill row, verifies `open`, then inserts with `ON CONFLICT DO NOTHING`.
+- `CloseBillActivity`: locks bill row. If already `closed`, returns stored `total_amount`. If `open`, computes total and updates with `WHERE status = 'open'`; a lost update race falls back to stored total.
+
 ### State Integrity (two-layer guard)
 
 **Layer 1 — API handler**: Before signaling workflow, queries `SELECT status FROM bills WHERE id = $1`. If `closed` → 409 immediately. No signal sent.

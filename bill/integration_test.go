@@ -8,6 +8,8 @@ import (
 
 	"encore.dev/beta/errs"
 	"encore.dev/et"
+	"github.com/google/uuid"
+	"go.temporal.io/sdk/testsuite"
 )
 
 func setupIntegration(t *testing.T) (context.Context, *Service) {
@@ -36,6 +38,33 @@ func setupIntegration(t *testing.T) (context.Context, *Service) {
 	})
 
 	return ctx, svc
+}
+
+func setupActivityDB(t *testing.T) context.Context {
+	t.Helper()
+
+	ctx := context.Background()
+	testDB, err := et.NewTestDatabase(ctx, "fees_db")
+	if err != nil {
+		t.Skipf("Encore test database unavailable: %v", err)
+	}
+
+	originalDB := db
+	db = testDB
+	t.Cleanup(func() {
+		db = originalDB
+	})
+
+	return ctx
+}
+
+func newActivityEnv() *testsuite.TestActivityEnvironment {
+	var suite testsuite.WorkflowTestSuite
+	env := suite.NewTestActivityEnvironment()
+	env.RegisterActivity(CreateBillActivity)
+	env.RegisterActivity(AddLineItemActivity)
+	env.RegisterActivity(CloseBillActivity)
+	return env
 }
 
 func assertErrCode(t *testing.T, err error, want errs.ErrCode) {
@@ -130,6 +159,26 @@ func closeBill(t *testing.T, ctx context.Context, svc *Service, billID string) *
 		t.Fatalf("closed bill status = %q, want closed", bill.Status)
 	}
 	return bill
+}
+
+func insertOpenBill(t *testing.T, ctx context.Context, billID string) {
+	t.Helper()
+	_, err := db.Exec(ctx, `
+		INSERT INTO bills (id, status, currency, workflow_id, created_at)
+		VALUES ($1, 'open', 'USD', $2, $3)
+	`, billID, billID, time.Now())
+	if err != nil {
+		t.Fatalf("insert open bill: %v", err)
+	}
+}
+
+func countRows(t *testing.T, ctx context.Context, query string, args ...any) int {
+	t.Helper()
+	var count int
+	if err := db.QueryRow(ctx, query, args...).Scan(&count); err != nil {
+		t.Fatalf("count rows: %v", err)
+	}
+	return count
 }
 
 func TestHealth(t *testing.T) {
@@ -303,5 +352,79 @@ func TestEdgeCases(t *testing.T) {
 	}
 	if fetched.Total != nil {
 		t.Fatalf("open bill total = %q, want nil", *fetched.Total)
+	}
+}
+
+func TestActivityIdempotency(t *testing.T) {
+	ctx := setupActivityDB(t)
+	env := newActivityEnv()
+
+	billID := uuid.NewString()
+	params := BillParams{BillID: billID, Currency: "USD", CreatedAt: time.Now()}
+	if _, err := env.ExecuteActivity(CreateBillActivity, params); err != nil {
+		t.Fatalf("create bill first attempt: %v", err)
+	}
+	if _, err := env.ExecuteActivity(CreateBillActivity, params); err != nil {
+		t.Fatalf("create bill retry: %v", err)
+	}
+	if got := countRows(t, ctx, `SELECT COUNT(*) FROM bills WHERE id = $1`, billID); got != 1 {
+		t.Fatalf("bill count = %d, want 1", got)
+	}
+
+	signal := LineItemSignal{ID: uuid.NewString(), Description: "retry-safe", Quantity: 2, UnitPrice: 150}
+	if _, err := env.ExecuteActivity(AddLineItemActivity, billID, signal); err != nil {
+		t.Fatalf("add line item first attempt: %v", err)
+	}
+	if _, err := env.ExecuteActivity(AddLineItemActivity, billID, signal); err != nil {
+		t.Fatalf("add line item retry: %v", err)
+	}
+	if got := countRows(t, ctx, `SELECT COUNT(*) FROM line_items WHERE id = $1`, signal.ID); got != 1 {
+		t.Fatalf("line item count = %d, want 1", got)
+	}
+}
+
+func TestActivityIdempotencyAfterClose(t *testing.T) {
+	ctx := setupActivityDB(t)
+	env := newActivityEnv()
+
+	billID := uuid.NewString()
+	insertOpenBill(t, ctx, billID)
+
+	signal := LineItemSignal{ID: uuid.NewString(), Description: "before-close", Quantity: 1, UnitPrice: 250}
+	if _, err := env.ExecuteActivity(AddLineItemActivity, billID, signal); err != nil {
+		t.Fatalf("add line item: %v", err)
+	}
+
+	value, err := env.ExecuteActivity(CloseBillActivity, billID)
+	if err != nil {
+		t.Fatalf("close bill first attempt: %v", err)
+	}
+	var first CloseBillResult
+	if err := value.Get(&first); err != nil {
+		t.Fatalf("decode first close result: %v", err)
+	}
+
+	value, err = env.ExecuteActivity(CloseBillActivity, billID)
+	if err != nil {
+		t.Fatalf("close bill retry: %v", err)
+	}
+	var second CloseBillResult
+	if err := value.Get(&second); err != nil {
+		t.Fatalf("decode second close result: %v", err)
+	}
+	if first.Total != second.Total || second.Total != 250 {
+		t.Fatalf("close totals = %d and %d, want 250", first.Total, second.Total)
+	}
+
+	if _, err := env.ExecuteActivity(AddLineItemActivity, billID, signal); err != nil {
+		t.Fatalf("add line item retry after close: %v", err)
+	}
+	if got := countRows(t, ctx, `SELECT COUNT(*) FROM line_items WHERE id = $1`, signal.ID); got != 1 {
+		t.Fatalf("line item count after retry = %d, want 1", got)
+	}
+
+	lateSignal := LineItemSignal{ID: uuid.NewString(), Description: "after-close", Quantity: 1, UnitPrice: 100}
+	if _, err := env.ExecuteActivity(AddLineItemActivity, billID, lateSignal); err == nil {
+		t.Fatal("new line item after close succeeded, want error")
 	}
 }
