@@ -12,6 +12,8 @@ import (
 	"go.temporal.io/sdk/testsuite"
 )
 
+const defaultTestCustomerID = "test-customer"
+
 func setupIntegration(t *testing.T) (context.Context, *Service) {
 	t.Helper()
 
@@ -81,12 +83,21 @@ func assertErrCode(t *testing.T, err error, want errs.ErrCode) {
 	}
 }
 
+func billCustomerID(t *testing.T, ctx context.Context, billID string) string {
+	t.Helper()
+	var customerID string
+	if err := db.QueryRow(ctx, `SELECT customer_id FROM bills WHERE id = $1`, billID).Scan(&customerID); err != nil {
+		return defaultTestCustomerID
+	}
+	return customerID
+}
+
 func waitForBill(t *testing.T, ctx context.Context, svc *Service, id string) *BillResponse {
 	t.Helper()
 	deadline := time.Now().Add(6 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
-		bill, err := svc.GetBill(ctx, id)
+		bill, err := svc.GetBill(ctx, id, &TenantRequest{CustomerID: billCustomerID(t, ctx, id)})
 		if err == nil {
 			return bill
 		}
@@ -103,7 +114,7 @@ func waitForLineItemCount(t *testing.T, ctx context.Context, svc *Service, id st
 	var last *BillResponse
 	var lastErr error
 	for time.Now().Before(deadline) {
-		bill, err := svc.GetBill(ctx, id)
+		bill, err := svc.GetBill(ctx, id, &TenantRequest{CustomerID: billCustomerID(t, ctx, id)})
 		if err == nil {
 			last = bill
 			if len(bill.LineItems) == want {
@@ -123,6 +134,9 @@ func waitForLineItemCount(t *testing.T, ctx context.Context, svc *Service, id st
 
 func createBill(t *testing.T, ctx context.Context, svc *Service, req *CreateBillRequest) *CreateBillResponse {
 	t.Helper()
+	if req.CustomerID == "" {
+		req.CustomerID = defaultTestCustomerID
+	}
 	bill, err := svc.CreateBill(ctx, req)
 	if err != nil {
 		t.Fatalf("create bill: %v", err)
@@ -139,6 +153,9 @@ func createBill(t *testing.T, ctx context.Context, svc *Service, req *CreateBill
 
 func addLineItem(t *testing.T, ctx context.Context, svc *Service, billID string, req *AddLineItemRequest, wantAmount string) *AddLineItemResponse {
 	t.Helper()
+	if req.CustomerID == "" {
+		req.CustomerID = billCustomerID(t, ctx, billID)
+	}
 	item, err := svc.AddLineItem(ctx, billID, req)
 	if err != nil {
 		t.Fatalf("add line item: %v", err)
@@ -151,7 +168,7 @@ func addLineItem(t *testing.T, ctx context.Context, svc *Service, billID string,
 
 func closeBill(t *testing.T, ctx context.Context, svc *Service, billID string) *CloseBillResponse {
 	t.Helper()
-	bill, err := svc.CloseBill(ctx, billID)
+	bill, err := svc.CloseBill(ctx, billID, &TenantRequest{CustomerID: billCustomerID(t, ctx, billID)})
 	if err != nil {
 		t.Fatalf("close bill: %v", err)
 	}
@@ -164,9 +181,9 @@ func closeBill(t *testing.T, ctx context.Context, svc *Service, billID string) *
 func insertOpenBill(t *testing.T, ctx context.Context, billID string) {
 	t.Helper()
 	_, err := db.Exec(ctx, `
-		INSERT INTO bills (id, status, currency, workflow_id, created_at)
-		VALUES ($1, 'open', 'USD', $2, $3)
-	`, billID, billID, time.Now())
+		INSERT INTO bills (id, status, currency, customer_id, workflow_id, created_at)
+		VALUES ($1, 'open', 'USD', $2, $3, $4)
+	`, billID, defaultTestCustomerID, billID, time.Now())
 	if err != nil {
 		t.Fatalf("insert open bill: %v", err)
 	}
@@ -223,7 +240,7 @@ func TestUSDBillLifecycle(t *testing.T) {
 		t.Fatalf("closed bill line items = %d, want 3", len(closed.LineItems))
 	}
 
-	fetched, err := svc.GetBill(ctx, created.ID)
+	fetched, err := svc.GetBill(ctx, created.ID, &TenantRequest{CustomerID: "acme-1"})
 	if err != nil {
 		t.Fatalf("get bill: %v", err)
 	}
@@ -237,7 +254,7 @@ func TestUSDBillLifecycle(t *testing.T) {
 		t.Fatalf("fetched line items = %d, want 3", len(fetched.LineItems))
 	}
 
-	list, err := svc.ListBills(ctx)
+	list, err := svc.ListBills(ctx, &TenantRequest{CustomerID: "acme-1"})
 	if err != nil {
 		t.Fatalf("list bills: %v", err)
 	}
@@ -277,24 +294,24 @@ func TestGELBillLifecycle(t *testing.T) {
 func TestValidation(t *testing.T) {
 	ctx, svc := setupIntegration(t)
 
-	_, err := svc.CreateBill(ctx, &CreateBillRequest{Currency: "EUR"})
+	_, err := svc.CreateBill(ctx, &CreateBillRequest{Currency: "EUR", CustomerID: defaultTestCustomerID})
 	assertErrCode(t, err, errs.InvalidArgument)
 
-	_, err = svc.CreateBill(ctx, &CreateBillRequest{Currency: ""})
+	_, err = svc.CreateBill(ctx, &CreateBillRequest{Currency: "", CustomerID: defaultTestCustomerID})
 	assertErrCode(t, err, errs.InvalidArgument)
 
 	created := createBill(t, ctx, svc, &CreateBillRequest{Currency: "USD"})
 
-	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 0, UnitPrice: "1.00"})
+	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 0, UnitPrice: "1.00", CustomerID: billCustomerID(t, ctx, created.ID)})
 	assertErrCode(t, err, errs.InvalidArgument)
 
-	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: -1, UnitPrice: "1.00"})
+	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: -1, UnitPrice: "1.00", CustomerID: billCustomerID(t, ctx, created.ID)})
 	assertErrCode(t, err, errs.InvalidArgument)
 
-	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 1, UnitPrice: "0"})
+	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 1, UnitPrice: "0", CustomerID: billCustomerID(t, ctx, created.ID)})
 	assertErrCode(t, err, errs.InvalidArgument)
 
-	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 1, UnitPrice: "-1.00"})
+	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 1, UnitPrice: "-1.00", CustomerID: billCustomerID(t, ctx, created.ID)})
 	assertErrCode(t, err, errs.InvalidArgument)
 }
 
@@ -303,13 +320,13 @@ func TestStateIntegrity(t *testing.T) {
 
 	missingID := "00000000-0000-0000-0000-000000000000"
 
-	_, err := svc.AddLineItem(ctx, missingID, &AddLineItemRequest{Description: "missing", Quantity: 1, UnitPrice: "1.00"})
+	_, err := svc.AddLineItem(ctx, missingID, &AddLineItemRequest{Description: "missing", Quantity: 1, UnitPrice: "1.00", CustomerID: defaultTestCustomerID})
 	assertErrCode(t, err, errs.NotFound)
 
-	_, err = svc.CloseBill(ctx, missingID)
+	_, err = svc.CloseBill(ctx, missingID, &TenantRequest{CustomerID: defaultTestCustomerID})
 	assertErrCode(t, err, errs.NotFound)
 
-	_, err = svc.GetBill(ctx, missingID)
+	_, err = svc.GetBill(ctx, missingID, &TenantRequest{CustomerID: defaultTestCustomerID})
 	assertErrCode(t, err, errs.NotFound)
 
 	created := createBill(t, ctx, svc, &CreateBillRequest{Currency: "USD"})
@@ -317,10 +334,10 @@ func TestStateIntegrity(t *testing.T) {
 	waitForLineItemCount(t, ctx, svc, created.ID, 1)
 	closeBill(t, ctx, svc, created.ID)
 
-	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "too late", Quantity: 1, UnitPrice: "1.00"})
+	_, err = svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "too late", Quantity: 1, UnitPrice: "1.00", CustomerID: billCustomerID(t, ctx, created.ID)})
 	assertErrCode(t, err, errs.Aborted)
 
-	_, err = svc.CloseBill(ctx, created.ID)
+	_, err = svc.CloseBill(ctx, created.ID, &TenantRequest{CustomerID: billCustomerID(t, ctx, created.ID)})
 	assertErrCode(t, err, errs.Aborted)
 }
 
@@ -360,7 +377,7 @@ func TestActivityIdempotency(t *testing.T) {
 	env := newActivityEnv()
 
 	billID := uuid.NewString()
-	params := BillParams{BillID: billID, Currency: "USD", CreatedAt: time.Now()}
+	params := BillParams{BillID: billID, Currency: "USD", CustomerID: defaultTestCustomerID, CreatedAt: time.Now()}
 	if _, err := env.ExecuteActivity(CreateBillActivity, params); err != nil {
 		t.Fatalf("create bill first attempt: %v", err)
 	}

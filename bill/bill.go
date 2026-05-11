@@ -3,6 +3,7 @@ package bill
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"encore.dev/beta/errs"
@@ -12,7 +13,7 @@ import (
 
 type CreateBillRequest struct {
 	Currency       string `json:"currency"`
-	CustomerID     string `json:"customer_id,omitempty"`
+	CustomerID     string `header:"customer-id"`
 	IdempotencyKey string `header:"Idempotency-Key"`
 }
 
@@ -28,7 +29,12 @@ type AddLineItemRequest struct {
 	Description    string `json:"description"`
 	Quantity       int    `json:"quantity"`
 	UnitPrice      string `json:"unit_price"`
+	CustomerID     string `header:"customer-id"`
 	IdempotencyKey string `header:"Idempotency-Key"`
+}
+
+type TenantRequest struct {
+	CustomerID string `header:"customer-id"`
 }
 
 type AddLineItemResponse struct {
@@ -83,25 +89,36 @@ type BillSummary struct {
 	ClosedAt  *time.Time `json:"closed_at,omitempty"`
 }
 
+func requireCustomerID(customerID string) (string, error) {
+	customerID = strings.TrimSpace(customerID)
+	if customerID == "" {
+		return "", errs.WrapCode(errors.New("missing customer-id"), errs.Unauthenticated, "missing_customer_id")
+	}
+	return customerID, nil
+}
+
 //encore:api public method=POST path=/bills
 func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*CreateBillResponse, error) {
+	customerID, err := requireCustomerID(req.CustomerID)
+	if err != nil {
+		return nil, err
+	}
 	if req.Currency != "USD" && req.Currency != "GEL" {
 		return nil, errs.WrapCode(errors.New("currency must be USD or GEL"), errs.InvalidArgument, "invalid_currency")
 	}
 
 	payload := struct {
-		Currency   string `json:"currency"`
-		CustomerID string `json:"customer_id,omitempty"`
-	}{Currency: req.Currency, CustomerID: req.CustomerID}
+		Currency string `json:"currency"`
+	}{Currency: req.Currency}
 
-	return withIdempotency(ctx, req.CustomerID, "create_bill", req.IdempotencyKey, payload, func() (*CreateBillResponse, error) {
+	return withIdempotency(ctx, customerID, "create_bill", req.IdempotencyKey, payload, func() (*CreateBillResponse, error) {
 		billID := uuid.NewString()
 		createdAt := time.Now()
 
 		params := BillParams{
 			BillID:     billID,
 			Currency:   req.Currency,
-			CustomerID: req.CustomerID,
+			CustomerID: customerID,
 			CreatedAt:  createdAt,
 		}
 
@@ -127,6 +144,10 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 
 //encore:api public method=POST path=/bills/:id/line-items
 func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRequest) (*AddLineItemResponse, error) {
+	customerID, err := requireCustomerID(req.CustomerID)
+	if err != nil {
+		return nil, err
+	}
 	if req.Quantity <= 0 {
 		return nil, errs.WrapCode(errors.New("quantity must be greater than 0"), errs.InvalidArgument, "invalid_quantity")
 	}
@@ -141,15 +162,15 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 		UnitPrice   int64  `json:"unit_price_minor"`
 	}{Description: req.Description, Quantity: req.Quantity, UnitPrice: unitPriceMinor}
 
-	var customerID string
-	err = db.QueryRow(ctx, `SELECT COALESCE(customer_id, '') FROM bills WHERE id = $1`, id).Scan(&customerID)
+	var exists int
+	err = db.QueryRow(ctx, `SELECT 1 FROM bills WHERE id = $1 AND customer_id = $2`, id, customerID).Scan(&exists)
 	if err != nil {
 		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
 	}
 
 	return withIdempotency(ctx, customerID, "add_line_item:"+id, req.IdempotencyKey, payload, func() (*AddLineItemResponse, error) {
 		var status string
-		err = db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
+		err = db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1 AND customer_id = $2`, id, customerID).Scan(&status)
 		if err != nil {
 			return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
 		}
@@ -183,9 +204,13 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 }
 
 //encore:api public method=POST path=/bills/:id/close
-func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse, error) {
+func (s *Service) CloseBill(ctx context.Context, id string, req *TenantRequest) (*CloseBillResponse, error) {
+	customerID, err := requireCustomerID(req.CustomerID)
+	if err != nil {
+		return nil, err
+	}
 	var status string
-	err := db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
+	err = db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1 AND customer_id = $2`, id, customerID).Scan(&status)
 	if err != nil {
 		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
 	}
@@ -212,8 +237,8 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 	}
 	err = db.QueryRow(ctx, `
 		SELECT currency, total_amount, closed_at
-		FROM bills WHERE id = $1
-	`, id).Scan(&bill.Currency, &bill.Total, &bill.ClosedAt)
+		FROM bills WHERE id = $1 AND customer_id = $2
+	`, id, customerID).Scan(&bill.Currency, &bill.Total, &bill.ClosedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -252,7 +277,11 @@ func (s *Service) CloseBill(ctx context.Context, id string) (*CloseBillResponse,
 }
 
 //encore:api public method=GET path=/bills/:id
-func (s *Service) GetBill(ctx context.Context, id string) (*BillResponse, error) {
+func (s *Service) GetBill(ctx context.Context, id string, req *TenantRequest) (*BillResponse, error) {
+	customerID, err := requireCustomerID(req.CustomerID)
+	if err != nil {
+		return nil, err
+	}
 	var bill struct {
 		Status     string
 		Currency   string
@@ -261,10 +290,10 @@ func (s *Service) GetBill(ctx context.Context, id string) (*BillResponse, error)
 		CreatedAt  time.Time
 		ClosedAt   *time.Time
 	}
-	err := db.QueryRow(ctx, `
+	err = db.QueryRow(ctx, `
 		SELECT status, currency, customer_id, total_amount, created_at, closed_at
-		FROM bills WHERE id = $1
-	`, id).Scan(&bill.Status, &bill.Currency, &bill.CustomerID, &bill.Total, &bill.CreatedAt, &bill.ClosedAt)
+		FROM bills WHERE id = $1 AND customer_id = $2
+	`, id, customerID).Scan(&bill.Status, &bill.Currency, &bill.CustomerID, &bill.Total, &bill.CreatedAt, &bill.ClosedAt)
 	if err != nil {
 		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
 	}
@@ -310,12 +339,17 @@ func (s *Service) GetBill(ctx context.Context, id string) (*BillResponse, error)
 }
 
 //encore:api public method=GET path=/bills
-func (s *Service) ListBills(ctx context.Context) (*ListBillsResponse, error) {
+func (s *Service) ListBills(ctx context.Context, req *TenantRequest) (*ListBillsResponse, error) {
+	customerID, err := requireCustomerID(req.CustomerID)
+	if err != nil {
+		return nil, err
+	}
 	rows, err := db.Query(ctx, `
 		SELECT id, status, currency, total_amount, created_at, closed_at
 		FROM bills
+		WHERE customer_id = $1
 		ORDER BY created_at DESC
-	`)
+	`, customerID)
 	if err != nil {
 		return nil, err
 	}

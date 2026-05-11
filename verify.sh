@@ -2,6 +2,7 @@
 set -u
 
 BASE_URL="${BASE_URL:-http://localhost:4000}"
+CUSTOMER_ID="${CUSTOMER_ID:-acme-1}"
 CURL_CONNECT_TIMEOUT="${CURL_CONNECT_TIMEOUT:-2}"
 CURL_MAX_TIME="${CURL_MAX_TIME:-15}"
 
@@ -43,29 +44,63 @@ require_cmd() {
 }
 
 request() {
-  local method="$1"
-  local path="$2"
-  local data="${3:-}"
+	request_as "$CUSTOMER_ID" "$@"
+}
+
+request_as() {
+	local customer_id="$1"
+	shift
+	local method="$1"
+	local path="$2"
+	local data="${3:-}"
 
   [[ -n "${tmp_body:-}" && -f "$tmp_body" ]] && rm -f "$tmp_body"
   [[ -n "${tmp_code:-}" && -f "$tmp_code" ]] && rm -f "$tmp_code"
 
-  tmp_body="$(mktemp)"
-  tmp_code="$(mktemp)"
+		tmp_body="$(mktemp)"
+	tmp_code="$(mktemp)"
 
-  if [[ -n "$data" ]]; then
-    curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
-      -o "$tmp_body" -w "%{http_code}" \
-      -X "$method" \
-      -H "Content-Type: application/json" \
-      -d "$data" \
-      "$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
-  else
-    curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
-      -o "$tmp_body" -w "%{http_code}" \
-      -X "$method" \
-      "$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
-  fi
+	if [[ -n "$data" ]]; then
+		curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+			-o "$tmp_body" -w "%{http_code}" \
+			-X "$method" \
+			-H "Content-Type: application/json" \
+			-H "customer-id: $customer_id" \
+			-d "$data" \
+			"$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
+	else
+		curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+			-o "$tmp_body" -w "%{http_code}" \
+			-X "$method" \
+			-H "customer-id: $customer_id" \
+			"$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
+	fi
+}
+
+request_no_customer() {
+	local method="$1"
+	local path="$2"
+	local data="${3:-}"
+
+	[[ -n "${tmp_body:-}" && -f "$tmp_body" ]] && rm -f "$tmp_body"
+	[[ -n "${tmp_code:-}" && -f "$tmp_code" ]] && rm -f "$tmp_code"
+
+	tmp_body="$(mktemp)"
+	tmp_code="$(mktemp)"
+
+	if [[ -n "$data" ]]; then
+		curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+			-o "$tmp_body" -w "%{http_code}" \
+			-X "$method" \
+			-H "Content-Type: application/json" \
+			-d "$data" \
+			"$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
+	else
+		curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
+			-o "$tmp_body" -w "%{http_code}" \
+			-X "$method" \
+			"$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
+	fi
 }
 
 status_code() {
@@ -133,6 +168,19 @@ assert_json_contains_id() {
   fi
 }
 
+assert_json_missing_id() {
+	local id="$1"
+	local label="$2"
+	local found
+	found="$(jq -r --arg id "$id" 'any(.bills[]?; .id == $id)' "$tmp_body")"
+
+	if [[ "$found" == "false" ]]; then
+		log_pass "$label"
+	else
+		log_fail "$label" "expected bills list to exclude $id; body: $(body)"
+	fi
+}
+
 wait_for_bill() {
   local id="$1"
   local label="$2"
@@ -186,7 +234,7 @@ assert_json_eq '.status' 'ok' "health status ok"
 assert_json_eq '.temporal_reachable' 'true' "temporal reachable"
 
 print_section "Phase 1: USD Happy Path"
-request POST "/bills" '{"currency":"USD","customer_id":"acme-1"}'
+request POST "/bills" '{"currency":"USD"}'
 assert_status 200 "create USD bill returns 200"
 assert_json_eq '.status' 'open' "USD bill starts open"
 assert_json_eq '.currency' 'USD' "USD bill currency set"
@@ -230,6 +278,31 @@ assert_json_eq '.line_items | length' '3' "get USD bill line item count"
 request GET "/bills"
 assert_status 200 "list bills returns 200"
 assert_json_contains_id "$usd_id" "list bills contains USD bill"
+
+print_section "Phase 1a: Tenant Isolation"
+other_customer_id="other-customer"
+
+request_as "$other_customer_id" GET "/bills/$usd_id"
+assert_status 404 "cross-tenant get bill returns 404"
+
+request_as "$other_customer_id" POST "/bills/$usd_id/line-items" '{"description":"intruder","quantity":1,"unit_price":"1.00"}'
+assert_status 404 "cross-tenant add line item returns 404"
+
+request_as "$other_customer_id" POST "/bills/$usd_id/close"
+assert_status 404 "cross-tenant close bill returns 404"
+
+request_as "$other_customer_id" GET "/bills"
+assert_status 200 "cross-tenant list bills returns 200"
+assert_json_missing_id "$usd_id" "cross-tenant list excludes USD bill"
+
+request_no_customer POST "/bills" '{"currency":"USD"}'
+assert_status 401 "create bill without customer-id returns 401"
+
+request_no_customer GET "/bills"
+assert_status 401 "list bills without customer-id returns 401"
+
+request_no_customer GET "/bills/$usd_id"
+assert_status 401 "get bill without customer-id returns 401"
 
 print_section "Phase 2: GEL Happy Path"
 request POST "/bills" '{"currency":"GEL"}'

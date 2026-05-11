@@ -115,9 +115,9 @@ func TestCreateBillIdempotencyConflict(t *testing.T) {
 func TestCreateBillIdempotencyDoesNotCacheValidationError(t *testing.T) {
 	ctx, svc := setupIntegration(t)
 
-	_, err := svc.CreateBill(ctx, &CreateBillRequest{Currency: "EUR", IdempotencyKey: "create-validation"})
+	_, err := svc.CreateBill(ctx, &CreateBillRequest{Currency: "EUR", CustomerID: defaultTestCustomerID, IdempotencyKey: "create-validation"})
 	assertErrCode(t, err, errs.InvalidArgument)
-	if got := countIdempotencyRecords(t, ctx, "", "create_bill", "create-validation"); got != 0 {
+	if got := countIdempotencyRecords(t, ctx, defaultTestCustomerID, "create_bill", "create-validation"); got != 0 {
 		t.Fatalf("idempotency record count after validation error = %d, want 0", got)
 	}
 
@@ -199,7 +199,7 @@ func TestAddLineItemIdempotencyConflict(t *testing.T) {
 	created := createBill(t, ctx, svc, &CreateBillRequest{Currency: "USD"})
 
 	addLineItemWithKey(t, ctx, svc, created.ID, "add-conflict", &AddLineItemRequest{Description: "apple", Quantity: 1, UnitPrice: "1.00"}, "1.00")
-	_, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "pear", Quantity: 1, UnitPrice: "1.00", IdempotencyKey: "add-conflict"})
+	_, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "pear", Quantity: 1, UnitPrice: "1.00", CustomerID: billCustomerID(t, ctx, created.ID), IdempotencyKey: "add-conflict"})
 	assertErrCode(t, err, errs.Aborted)
 	waitForLineItemCount(t, ctx, svc, created.ID, 1)
 }
@@ -223,9 +223,9 @@ func TestAddLineItemNewKeyAfterBillClose(t *testing.T) {
 	created := createBill(t, ctx, svc, &CreateBillRequest{Currency: "USD"})
 	closeBill(t, ctx, svc, created.ID)
 
-	_, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "late", Quantity: 1, UnitPrice: "1.00", IdempotencyKey: "new-key-after-close"})
+	_, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "late", Quantity: 1, UnitPrice: "1.00", CustomerID: billCustomerID(t, ctx, created.ID), IdempotencyKey: "new-key-after-close"})
 	assertErrCode(t, err, errs.Aborted)
-	if got := countIdempotencyRecords(t, ctx, "", "add_line_item:"+created.ID, "new-key-after-close"); got != 0 {
+	if got := countIdempotencyRecords(t, ctx, billCustomerID(t, ctx, created.ID), "add_line_item:"+created.ID, "new-key-after-close"); got != 0 {
 		t.Fatalf("idempotency record count after closed-bill error = %d, want 0", got)
 	}
 }
@@ -234,9 +234,9 @@ func TestAddLineItemIdempotencyDoesNotCacheValidationError(t *testing.T) {
 	ctx, svc := setupIntegration(t)
 	created := createBill(t, ctx, svc, &CreateBillRequest{Currency: "USD"})
 
-	_, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 0, UnitPrice: "1.00", IdempotencyKey: "add-validation"})
+	_, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "bad", Quantity: 0, UnitPrice: "1.00", CustomerID: billCustomerID(t, ctx, created.ID), IdempotencyKey: "add-validation"})
 	assertErrCode(t, err, errs.InvalidArgument)
-	if got := countIdempotencyRecords(t, ctx, "", "add_line_item:"+created.ID, "add-validation"); got != 0 {
+	if got := countIdempotencyRecords(t, ctx, billCustomerID(t, ctx, created.ID), "add_line_item:"+created.ID, "add-validation"); got != 0 {
 		t.Fatalf("idempotency record count after validation error = %d, want 0", got)
 	}
 	addLineItemWithKey(t, ctx, svc, created.ID, "add-validation", &AddLineItemRequest{Description: "good", Quantity: 1, UnitPrice: "1.00"}, "1.00")
@@ -246,9 +246,9 @@ func TestAddLineItemIdempotencyDoesNotCacheMissingBill(t *testing.T) {
 	ctx, svc := setupIntegration(t)
 	missingID := "00000000-0000-0000-0000-000000000000"
 
-	_, err := svc.AddLineItem(ctx, missingID, &AddLineItemRequest{Description: "missing", Quantity: 1, UnitPrice: "1.00", IdempotencyKey: "add-missing"})
+	_, err := svc.AddLineItem(ctx, missingID, &AddLineItemRequest{Description: "missing", Quantity: 1, UnitPrice: "1.00", CustomerID: defaultTestCustomerID, IdempotencyKey: "add-missing"})
 	assertErrCode(t, err, errs.NotFound)
-	if got := countIdempotencyRecords(t, ctx, "", "add_line_item:"+missingID, "add-missing"); got != 0 {
+	if got := countIdempotencyRecords(t, ctx, defaultTestCustomerID, "add_line_item:"+missingID, "add-missing"); got != 0 {
 		t.Fatalf("idempotency record count after missing-bill error = %d, want 0", got)
 	}
 }
@@ -280,7 +280,7 @@ func TestConcurrentAddLineItemIdempotency(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			res, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "concurrent", Quantity: 1, UnitPrice: "2.00", IdempotencyKey: "add-concurrent"})
+			res, err := svc.AddLineItem(ctx, created.ID, &AddLineItemRequest{Description: "concurrent", Quantity: 1, UnitPrice: "2.00", CustomerID: billCustomerID(t, ctx, created.ID), IdempotencyKey: "add-concurrent"})
 			if err != nil {
 				errsCh <- err
 				return
@@ -324,12 +324,12 @@ func TestIdempotencyIncompleteRecordNotReturnedAsSuccess(t *testing.T) {
 	_, err := db.Exec(ctx, `
 		INSERT INTO idempotency_records (customer_id, scope, key, request_hash, state)
 		VALUES ($1, $2, $3, $4, 'in_progress')
-	`, "", "create_bill", "incomplete", "stuck-hash")
+	`, defaultTestCustomerID, "create_bill", "incomplete", "stuck-hash")
 	if err != nil {
 		t.Fatalf("insert incomplete record: %v", err)
 	}
 
-	_, err = svc.CreateBill(ctx, &CreateBillRequest{Currency: "USD", IdempotencyKey: "incomplete"})
+	_, err = svc.CreateBill(ctx, &CreateBillRequest{Currency: "USD", CustomerID: defaultTestCustomerID, IdempotencyKey: "incomplete"})
 	assertErrCode(t, err, errs.Aborted)
 	if got := countRows(t, ctx, `SELECT COUNT(*) FROM bills`); got != 0 {
 		t.Fatalf("bill count after incomplete record = %d, want 0", got)

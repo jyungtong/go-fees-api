@@ -35,6 +35,20 @@ A billing service that tracks progressive fee accrual over a billing period. Lin
 
 ---
 
+## 2a. Multi-Tenant Isolation
+
+| Concept | Detail |
+|---------|--------|
+| **Tenant source** | `customer-id` HTTP header attached by auth middleware |
+| **No body tenant field** | `customer_id` MUST NOT appear in request bodies |
+| **Per-request** | Middleware resolves API key → `customer-id` → attached to each request |
+| **Lookup scope** | All bill queries include `WHERE customer_id = :tenant` |
+| **Cross-bill access** | Bill IDs are scoped — foreign/missing IDs return `404 Not Found` |
+| **Idempotency scope** | Keys scoped by authenticated `customer_id` |
+| **Anonymous unsupported** | No shared/empty namespace for idempotency |
+
+---
+
 ## 3. API Design
 
 | Method | Path | Purpose |
@@ -50,7 +64,7 @@ A billing service that tracks progressive fee accrual over a billing period. Lin
 ```
 POST /bills
   Idempotency-Key?: client-generated retry key
-  → { "currency": "USD"|"GEL", "customer_id"?: "client-1" }
+  → { "currency": "USD"|"GEL" }
   ← { "id", "status": "open", "currency", "workflow_id", "created_at" }
 
 POST /bills/:id/line-items
@@ -79,9 +93,9 @@ GET /bills
 | Column | Type | Notes |
 |--------|------|-------|
 | `id` | `UUID PK` | Bill identifier |
-| `status` | `TEXT` | `open` or `closed` |
+| `status` | `TEXT NOT NULL` | `open` or `closed` |
 | `currency` | `TEXT` | `USD` or `GEL` |
-| `customer_id` | `TEXT` | Optional customer reference |
+| `customer_id` | `TEXT NOT NULL` | Tenant ID — set from `customer-id` header, never request body |
 | `period_start` | `TIMESTAMPTZ` | Start of billing period |
 | `period_end` | `TIMESTAMPTZ` | End of billing period |
 | `total_amount` | `BIGINT` | Sum in minor units, set on close |
@@ -89,6 +103,8 @@ GET /bills
 | `created_at` | `TIMESTAMPTZ` | |
 | `closed_at` | `TIMESTAMPTZ` | Set on close, nullable |
 | `updated_at` | `TIMESTAMPTZ` | |
+
+**Indexes**: `(customer_id, created_at DESC)` for tenant listing.
 
 ### `line_items`
 
@@ -107,7 +123,7 @@ GET /bills
 
 | Column | Type | Notes |
 |--------|------|-------|
-| `customer_id` | `TEXT` | Customer/tenant namespace for the idempotency key. Empty string is the anonymous/shared namespace |
+| `customer_id` | `TEXT NOT NULL` | Customer/tenant namespace for the idempotency key |
 | `scope` | `TEXT` | Mutation/resource scope, e.g. `create_bill`, `add_line_item:<bill_id>` |
 | `key` | `TEXT` | Client-provided `Idempotency-Key` |
 | `request_hash` | `TEXT` | Hash of canonical mutation payload |
@@ -157,10 +173,9 @@ Temporal may retry activities after timeout or worker failure. Activities are sa
 
 `POST /bills` and `POST /bills/:id/line-items` accept optional `Idempotency-Key` headers to protect client/API retries. Requests without a key preserve normal behavior: repeated calls create distinct bills or line items and no idempotency record.
 
-- Keys are scoped by customer + mutation/resource (`customer_id`, `create_bill`, `add_line_item:<bill_id>`), so different customers can reuse the same key safely.
+- Keys are scoped by customer + mutation/resource (`customer_id`, `create_bill`, `add_line_item:<bill_id>`), so different customers can reuse the same key safely. The `customer_id` is derived from the authenticated `customer-id` header.
 - Same customer + scoped key + same canonical payload returns the original successful response without creating a duplicate bill/item.
 - Same customer + scoped key + different payload returns `409 Conflict`.
-- Empty `customer_id` uses a shared anonymous namespace, so anonymous keyed requests still conflict by `(scope, key)`.
 - Only successful mutations are cached. Validation errors, missing-resource errors, closed-bill errors for new keys, Temporal failures, and incomplete executions are not cached as successes.
 - In-progress records are never returned as successful responses; concurrent same-key requests wait/poll for completion or return an in-progress error.
 - Add-line-item replay checks idempotency storage before current bill status, so replaying a previously successful keyed add after bill close returns the original item response instead of `409`.
@@ -192,6 +207,7 @@ Temporal may retry activities after timeout or worker failure. Activities are sa
 
 | Scenario | HTTP Code |
 |----------|-----------|
+| Missing/invalid API key or tenant context | 401 Unauthorized |
 | Invalid currency (not USD/GEL) | 400 Bad Request |
 | Quantity ≤ 0 or invalid/non-positive unit_price | 400 Bad Request |
 | Bill not found | 404 Not Found |
@@ -224,6 +240,15 @@ API handler queries `status` before signaling. If already `closed` → 409. No s
 ### Concurrent Add + Close
 
 `FOR UPDATE` row lock in both activities serializes access to the bill row. Only one succeeds first; the other sees `status != 'open'` and errors.
+
+---
+
+## 8a. Cross-Tenant Access
+
+- `GET /bills/:id`, `POST /bills/:id/line-items`, `POST /bills/:id/close` all query with `WHERE id = $1 AND customer_id = $2`.
+- If bill not found OR bill belongs to different `customer_id` → `404 Not Found`.
+- This prevents bill ID enumeration attacks.
+- `GET /bills` returns only bills matching the authenticated `customer_id`.
 
 ---
 
