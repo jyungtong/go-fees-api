@@ -11,8 +11,9 @@ import (
 )
 
 type CreateBillRequest struct {
-	Currency   string `json:"currency"`
-	CustomerID string `json:"customer_id,omitempty"`
+	Currency       string `json:"currency"`
+	CustomerID     string `json:"customer_id,omitempty"`
+	IdempotencyKey string `header:"Idempotency-Key"`
 }
 
 type CreateBillResponse struct {
@@ -24,9 +25,10 @@ type CreateBillResponse struct {
 }
 
 type AddLineItemRequest struct {
-	Description string `json:"description"`
-	Quantity    int    `json:"quantity"`
-	UnitPrice   string `json:"unit_price"`
+	Description    string `json:"description"`
+	Quantity       int    `json:"quantity"`
+	UnitPrice      string `json:"unit_price"`
+	IdempotencyKey string `header:"Idempotency-Key"`
 }
 
 type AddLineItemResponse struct {
@@ -87,33 +89,40 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 		return nil, errs.WrapCode(errors.New("currency must be USD or GEL"), errs.InvalidArgument, "invalid_currency")
 	}
 
-	billID := uuid.NewString()
-	createdAt := time.Now()
+	payload := struct {
+		Currency   string `json:"currency"`
+		CustomerID string `json:"customer_id,omitempty"`
+	}{Currency: req.Currency, CustomerID: req.CustomerID}
 
-	params := BillParams{
-		BillID:     billID,
-		Currency:   req.Currency,
-		CustomerID: req.CustomerID,
-		CreatedAt:  createdAt,
-	}
+	return withIdempotency(ctx, "create_bill", req.IdempotencyKey, payload, func() (*CreateBillResponse, error) {
+		billID := uuid.NewString()
+		createdAt := time.Now()
 
-	workflowOptions := client.StartWorkflowOptions{
-		ID:        billID,
-		TaskQueue: taskQueue,
-	}
+		params := BillParams{
+			BillID:     billID,
+			Currency:   req.Currency,
+			CustomerID: req.CustomerID,
+			CreatedAt:  createdAt,
+		}
 
-	_, err := s.temporalClient.ExecuteWorkflow(ctx, workflowOptions, BillWorkflow, params)
-	if err != nil {
-		return nil, err
-	}
+		workflowOptions := client.StartWorkflowOptions{
+			ID:        billID,
+			TaskQueue: taskQueue,
+		}
 
-	return &CreateBillResponse{
-		ID:         billID,
-		Status:     "open",
-		Currency:   req.Currency,
-		WorkflowID: billID,
-		CreatedAt:  createdAt,
-	}, nil
+		_, err := s.temporalClient.ExecuteWorkflow(ctx, workflowOptions, BillWorkflow, params)
+		if err != nil {
+			return nil, err
+		}
+
+		return &CreateBillResponse{
+			ID:         billID,
+			Status:     "open",
+			Currency:   req.Currency,
+			WorkflowID: billID,
+			CreatedAt:  createdAt,
+		}, nil
+	})
 }
 
 //encore:api public method=POST path=/bills/:id/line-items
@@ -126,37 +135,45 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 		return nil, errs.WrapCode(err, errs.InvalidArgument, "invalid_unit_price")
 	}
 
-	var status string
-	err = db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
-	if err != nil {
-		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
-	}
-	if status != "open" {
-		return nil, errs.WrapCode(errors.New("bill is already closed"), errs.Aborted, "bill_closed")
-	}
+	payload := struct {
+		Description string `json:"description"`
+		Quantity    int    `json:"quantity"`
+		UnitPrice   int64  `json:"unit_price_minor"`
+	}{Description: req.Description, Quantity: req.Quantity, UnitPrice: unitPriceMinor}
 
-	itemID := uuid.NewString()
-	signal := LineItemSignal{
-		ID:          itemID,
-		Description: req.Description,
-		Quantity:    req.Quantity,
-		UnitPrice:   unitPriceMinor,
-	}
+	return withIdempotency(ctx, "add_line_item:"+id, req.IdempotencyKey, payload, func() (*AddLineItemResponse, error) {
+		var status string
+		err = db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
+		if err != nil {
+			return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
+		}
+		if status != "open" {
+			return nil, errs.WrapCode(errors.New("bill is already closed"), errs.Aborted, "bill_closed")
+		}
 
-	err = s.temporalClient.SignalWorkflow(ctx, id, "", "AddLineItem", signal)
-	if err != nil {
-		return nil, err
-	}
+		itemID := uuid.NewString()
+		signal := LineItemSignal{
+			ID:          itemID,
+			Description: req.Description,
+			Quantity:    req.Quantity,
+			UnitPrice:   unitPriceMinor,
+		}
 
-	return &AddLineItemResponse{
-		ID:          itemID,
-		BillID:      id,
-		Description: req.Description,
-		Quantity:    req.Quantity,
-		UnitPrice:   formatMoneyAmount(unitPriceMinor),
-		Amount:      formatMoneyAmount(int64(req.Quantity) * unitPriceMinor),
-		CreatedAt:   time.Now(),
-	}, nil
+		err = s.temporalClient.SignalWorkflow(ctx, id, "", "AddLineItem", signal)
+		if err != nil {
+			return nil, err
+		}
+
+		return &AddLineItemResponse{
+			ID:          itemID,
+			BillID:      id,
+			Description: req.Description,
+			Quantity:    req.Quantity,
+			UnitPrice:   formatMoneyAmount(unitPriceMinor),
+			Amount:      formatMoneyAmount(int64(req.Quantity) * unitPriceMinor),
+			CreatedAt:   time.Now(),
+		}, nil
+	})
 }
 
 //encore:api public method=POST path=/bills/:id/close
