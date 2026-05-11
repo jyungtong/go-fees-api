@@ -22,7 +22,7 @@ func hashCanonicalPayload(payload any) (string, error) {
 	return hex.EncodeToString(hash[:]), nil
 }
 
-func withIdempotency[T any](ctx context.Context, scope, key string, payload any, fn func() (*T, error)) (*T, error) {
+func withIdempotency[T any](ctx context.Context, customerID, scope, key string, payload any, fn func() (*T, error)) (*T, error) {
 	if key == "" {
 		return fn()
 	}
@@ -35,18 +35,18 @@ func withIdempotency[T any](ctx context.Context, scope, key string, payload any,
 	deadline := time.Now().Add(idempotencyPollTimeout)
 	for {
 		tag, err := db.Exec(ctx, `
-			INSERT INTO idempotency_records (scope, key, request_hash, state)
-			VALUES ($1, $2, $3, 'in_progress')
-			ON CONFLICT (scope, key) DO NOTHING
-		`, scope, key, requestHash)
+			INSERT INTO idempotency_records (customer_id, scope, key, request_hash, state)
+			VALUES ($1, $2, $3, $4, 'in_progress')
+			ON CONFLICT (customer_id, scope, key) DO NOTHING
+		`, customerID, scope, key, requestHash)
 		if err != nil {
 			return nil, err
 		}
 		if tag.RowsAffected() == 1 {
-			return completeIdempotentMutation(ctx, scope, key, fn)
+			return completeIdempotentMutation(ctx, customerID, scope, key, fn)
 		}
 
-		res, done, err := replayIdempotentMutation[T](ctx, scope, key, requestHash)
+		res, done, err := replayIdempotentMutation[T](ctx, customerID, scope, key, requestHash)
 		if err != nil {
 			return nil, err
 		}
@@ -65,10 +65,10 @@ func withIdempotency[T any](ctx context.Context, scope, key string, payload any,
 	}
 }
 
-func completeIdempotentMutation[T any](ctx context.Context, scope, key string, fn func() (*T, error)) (*T, error) {
+func completeIdempotentMutation[T any](ctx context.Context, customerID, scope, key string, fn func() (*T, error)) (*T, error) {
 	res, err := fn()
 	if err != nil {
-		_, deleteErr := db.Exec(ctx, `DELETE FROM idempotency_records WHERE scope = $1 AND key = $2`, scope, key)
+		_, deleteErr := db.Exec(ctx, `DELETE FROM idempotency_records WHERE customer_id = $1 AND scope = $2 AND key = $3`, customerID, scope, key)
 		if deleteErr != nil {
 			return nil, deleteErr
 		}
@@ -82,22 +82,22 @@ func completeIdempotentMutation[T any](ctx context.Context, scope, key string, f
 	_, err = db.Exec(ctx, `
 		UPDATE idempotency_records
 		SET state = 'completed', response_status = 200, response_body = $1, updated_at = now(), completed_at = now()
-		WHERE scope = $2 AND key = $3
-	`, body, scope, key)
+		WHERE customer_id = $2 AND scope = $3 AND key = $4
+	`, body, customerID, scope, key)
 	if err != nil {
 		return nil, err
 	}
 	return res, nil
 }
 
-func replayIdempotentMutation[T any](ctx context.Context, scope, key, requestHash string) (*T, bool, error) {
+func replayIdempotentMutation[T any](ctx context.Context, customerID, scope, key, requestHash string) (*T, bool, error) {
 	var existingHash string
 	var state string
 	var body []byte
 	err := db.QueryRow(ctx, `
 		SELECT request_hash, state, response_body
-		FROM idempotency_records WHERE scope = $1 AND key = $2
-	`, scope, key).Scan(&existingHash, &state, &body)
+		FROM idempotency_records WHERE customer_id = $1 AND scope = $2 AND key = $3
+	`, customerID, scope, key).Scan(&existingHash, &state, &body)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, false, nil

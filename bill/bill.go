@@ -94,7 +94,7 @@ func (s *Service) CreateBill(ctx context.Context, req *CreateBillRequest) (*Crea
 		CustomerID string `json:"customer_id,omitempty"`
 	}{Currency: req.Currency, CustomerID: req.CustomerID}
 
-	return withIdempotency(ctx, "create_bill", req.IdempotencyKey, payload, func() (*CreateBillResponse, error) {
+	return withIdempotency(ctx, req.CustomerID, "create_bill", req.IdempotencyKey, payload, func() (*CreateBillResponse, error) {
 		billID := uuid.NewString()
 		createdAt := time.Now()
 
@@ -141,7 +141,13 @@ func (s *Service) AddLineItem(ctx context.Context, id string, req *AddLineItemRe
 		UnitPrice   int64  `json:"unit_price_minor"`
 	}{Description: req.Description, Quantity: req.Quantity, UnitPrice: unitPriceMinor}
 
-	return withIdempotency(ctx, "add_line_item:"+id, req.IdempotencyKey, payload, func() (*AddLineItemResponse, error) {
+	var customerID string
+	err = db.QueryRow(ctx, `SELECT COALESCE(customer_id, '') FROM bills WHERE id = $1`, id).Scan(&customerID)
+	if err != nil {
+		return nil, errs.WrapCode(errors.New("bill not found"), errs.NotFound, "bill_not_found")
+	}
+
+	return withIdempotency(ctx, customerID, "add_line_item:"+id, req.IdempotencyKey, payload, func() (*AddLineItemResponse, error) {
 		var status string
 		err = db.QueryRow(ctx, `SELECT status FROM bills WHERE id = $1`, id).Scan(&status)
 		if err != nil {

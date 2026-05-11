@@ -1,4 +1,5 @@
 CREATE TABLE idempotency_records (
+    customer_id TEXT NOT NULL,
     scope TEXT NOT NULL,
     key TEXT NOT NULL,
     request_hash TEXT NOT NULL,
@@ -8,5 +9,5 @@ CREATE TABLE idempotency_records (
     created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
     completed_at TIMESTAMPTZ,
-    PRIMARY KEY (scope, key)
+    PRIMARY KEY (customer_id, scope, key)
 );

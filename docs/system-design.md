@@ -107,6 +107,7 @@ GET /bills
 
 | Column | Type | Notes |
 |--------|------|-------|
+| `customer_id` | `TEXT` | Customer/tenant namespace for the idempotency key. Empty string is the anonymous/shared namespace |
 | `scope` | `TEXT` | Mutation/resource scope, e.g. `create_bill`, `add_line_item:<bill_id>` |
 | `key` | `TEXT` | Client-provided `Idempotency-Key` |
 | `request_hash` | `TEXT` | Hash of canonical mutation payload |
@@ -117,7 +118,7 @@ GET /bills
 | `updated_at` | `TIMESTAMPTZ` | |
 | `completed_at` | `TIMESTAMPTZ` | Set when response is persisted |
 
-Primary key: `(scope, key)`.
+Primary key: `(customer_id, scope, key)`.
 
 ---
 
@@ -154,11 +155,12 @@ Temporal may retry activities after timeout or worker failure. Activities are sa
 
 ### User-Facing Idempotency
 
-`POST /bills` and `POST /bills/:id/line-items` accept optional `Idempotency-Key` headers to protect client/API retries. Requests without a key preserve normal behavior: repeated calls create distinct bills or line items.
+`POST /bills` and `POST /bills/:id/line-items` accept optional `Idempotency-Key` headers to protect client/API retries. Requests without a key preserve normal behavior: repeated calls create distinct bills or line items and no idempotency record.
 
-- Keys are scoped by mutation/resource (`create_bill`, `add_line_item:<bill_id>`), so the same key can be reused safely outside its scope.
-- Same scoped key + same canonical payload returns the original successful response without creating a duplicate bill/item.
-- Same scoped key + different payload returns `409 Conflict`.
+- Keys are scoped by customer + mutation/resource (`customer_id`, `create_bill`, `add_line_item:<bill_id>`), so different customers can reuse the same key safely.
+- Same customer + scoped key + same canonical payload returns the original successful response without creating a duplicate bill/item.
+- Same customer + scoped key + different payload returns `409 Conflict`.
+- Empty `customer_id` uses a shared anonymous namespace, so anonymous keyed requests still conflict by `(scope, key)`.
 - Only successful mutations are cached. Validation errors, missing-resource errors, closed-bill errors for new keys, Temporal failures, and incomplete executions are not cached as successes.
 - In-progress records are never returned as successful responses; concurrent same-key requests wait/poll for completion or return an in-progress error.
 - Add-line-item replay checks idempotency storage before current bill status, so replaying a previously successful keyed add after bill close returns the original item response instead of `409`.
