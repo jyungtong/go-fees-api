@@ -53,6 +53,7 @@ request_as() {
 	local method="$1"
 	local path="$2"
 	local data="${3:-}"
+	local idempotency_key="${4:-}"
 
   [[ -n "${tmp_body:-}" && -f "$tmp_body" ]] && rm -f "$tmp_body"
   [[ -n "${tmp_code:-}" && -f "$tmp_code" ]] && rm -f "$tmp_code"
@@ -60,12 +61,18 @@ request_as() {
 		tmp_body="$(mktemp)"
 	tmp_code="$(mktemp)"
 
+	local idem_headers=()
+	if [[ -n "$idempotency_key" ]]; then
+		idem_headers=(-H "Idempotency-Key: $idempotency_key")
+	fi
+
 	if [[ -n "$data" ]]; then
 		curl -sS --connect-timeout "$CURL_CONNECT_TIMEOUT" --max-time "$CURL_MAX_TIME" \
 			-o "$tmp_body" -w "%{http_code}" \
 			-X "$method" \
 			-H "Content-Type: application/json" \
 			-H "customer-id: $customer_id" \
+			"${idem_headers[@]}" \
 			-d "$data" \
 			"$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
 	else
@@ -73,6 +80,7 @@ request_as() {
 			-o "$tmp_body" -w "%{http_code}" \
 			-X "$method" \
 			-H "customer-id: $customer_id" \
+			"${idem_headers[@]}" \
 			"$BASE_URL$path" >"$tmp_code" || printf "000" >"$tmp_code"
 	fi
 }
@@ -184,11 +192,12 @@ assert_json_missing_id() {
 wait_for_bill() {
   local id="$1"
   local label="$2"
+  local customer_id="${3:-$CUSTOMER_ID}"
   local attempts=30
   local delay=0.2
 
   for _ in $(seq 1 "$attempts"); do
-    request GET "/bills/$id"
+    request_as "$customer_id" GET "/bills/$id"
     if [[ "$(status_code)" == "200" ]]; then
       log_pass "$label"
       return 0
@@ -409,6 +418,77 @@ assert_status 200 "get open bill returns 200"
 assert_json_eq '.status' 'open' "open bill status remains open"
 assert_json_eq '.total' 'null' "open bill total is null"
 assert_json_eq '.line_items | length' '1' "open bill line item visible"
+
+print_section "Phase 6: Idempotency"
+
+# 6.1 Create bill with Idempotency-Key, replay same key+payload → same id, 200
+idem_key_bill="idem-key-bill-001"
+request POST "/bills" '{"currency":"USD"}' "$idem_key_bill"
+assert_status 200 "create bill with idempotency key returns 200"
+assert_json_eq '.status' 'open' "idem bill starts open"
+idem_bill_id="$(json_field '.id')"
+assert_json_nonempty '.id' "idem bill id present"
+
+request POST "/bills" '{"currency":"USD"}' "$idem_key_bill"
+assert_status 200 "replay same idempotency key + payload returns 200"
+assert_json_eq '.id' "$idem_bill_id" "replay returns same bill id"
+wait_for_bill "$idem_bill_id" "idem bill persisted" || exit 1
+
+# 6.2 Same key + different payload → 409
+request POST "/bills" '{"currency":"GEL"}' "$idem_key_bill"
+assert_status 409 "same idempotency key + different payload returns 409"
+
+# 6.3 Add line item with Idempotency-Key, replay same key+payload → same item, 200
+idem_key_item="idem-key-item-001"
+request POST "/bills/$idem_bill_id/line-items" '{"description":"widget","quantity":2,"unit_price":"3.50"}' "$idem_key_item"
+assert_status 200 "add line item with idempotency key returns 200"
+idem_item_id="$(json_field '.id')"
+assert_json_eq '.amount' '7.00' "idem line item amount"
+
+request POST "/bills/$idem_bill_id/line-items" '{"description":"widget","quantity":2,"unit_price":"3.50"}' "$idem_key_item"
+assert_status 200 "replay same idempotency key + payload returns 200"
+assert_json_eq '.id' "$idem_item_id" "replay returns same line item id"
+
+wait_for_line_items "$idem_bill_id" 1 "idem line item persisted" || exit 1
+
+# 6.4 Same key + different payload for line item → 409
+request POST "/bills/$idem_bill_id/line-items" '{"description":"different","quantity":1,"unit_price":"1.00"}' "$idem_key_item"
+assert_status 409 "same idempotency key + different line item payload returns 409"
+
+# 6.5 Same key used by different customer → creates separate bill (no conflict)
+other_customer_id="other-customer-idem"
+request_as "$other_customer_id" POST "/bills" '{"currency":"USD"}' "$idem_key_bill"
+assert_status 200 "different customer reusing same idempotency key returns 200"
+other_bill_id="$(json_field '.id')"
+if [[ "$other_bill_id" != "$idem_bill_id" ]]; then
+  log_pass "different customer gets different bill id"
+else
+  log_fail "different customer gets different bill id" "expected different id, got $other_bill_id"
+fi
+wait_for_bill "$other_bill_id" "other customer bill persisted" "$other_customer_id" || exit 1
+
+# 6.6 No Idempotency-Key → repeated calls create distinct bills
+request POST "/bills" '{"currency":"USD"}'
+assert_status 200 "create bill without idempotency key returns 200"
+no_idem_bill_1="$(json_field '.id')"
+
+request POST "/bills" '{"currency":"USD"}'
+assert_status 200 "create second bill without idempotency key returns 200"
+no_idem_bill_2="$(json_field '.id')"
+
+if [[ "$no_idem_bill_1" != "$no_idem_bill_2" ]]; then
+  log_pass "no idempotency key creates distinct bills"
+else
+  log_fail "no idempotency key creates distinct bills" "expected different ids, got $no_idem_bill_1 and $no_idem_bill_2"
+fi
+
+# 6.7 Idempotent add-line-item replay after bill close → returns original item (not 409)
+request POST "/bills/$idem_bill_id/close"
+assert_status 200 "close idem bill returns 200"
+
+request POST "/bills/$idem_bill_id/line-items" '{"description":"widget","quantity":2,"unit_price":"3.50"}' "$idem_key_item"
+assert_status 200 "replay idempotent add-line-item after close returns 200"
+assert_json_eq '.id' "$idem_item_id" "replay after close returns same line item id"
 
 printf "\n%bSummary%b %d passed, %d failed\n" "$yellow" "$reset" "$PASS" "$FAIL"
 
