@@ -30,7 +30,7 @@ A billing service that tracks progressive fee accrual over a billing period. Lin
 |-----------|------|
 | **Encore** | Service framework, API layer, DI, auto-provisioning |
 | **Temporal** | Long-running workflow engine. Workflow = bill lifecycle |
-| **PostgreSQL** | Persistent state (bills, line items). Accessed via Encore `sqldb` |
+| **PostgreSQL** | Persistent state (bills, line items, idempotency records). Accessed via Encore `sqldb` |
 | **Activities** | Side-effect-free DB operations called by workflow |
 
 ---
@@ -49,10 +49,12 @@ A billing service that tracks progressive fee accrual over a billing period. Lin
 
 ```
 POST /bills
+  Idempotency-Key?: client-generated retry key
   → { "currency": "USD"|"GEL", "customer_id"?: "client-1" }
   ← { "id", "status": "open", "currency", "workflow_id", "created_at" }
 
 POST /bills/:id/line-items
+  Idempotency-Key?: client-generated retry key
   → { "description": "broccoli", "quantity": 1, "unit_price": "3.50" }
       // unit_price is a decimal string in major units
   ← { "id", "bill_id", "description", "quantity", "unit_price", "amount", "created_at" }
@@ -101,6 +103,22 @@ GET /bills
 
 **Total** = `SUM(quantity * unit_price)` computed at close time. Not stored per line item.
 
+### `idempotency_records`
+
+| Column | Type | Notes |
+|--------|------|-------|
+| `scope` | `TEXT` | Mutation/resource scope, e.g. `create_bill`, `add_line_item:<bill_id>` |
+| `key` | `TEXT` | Client-provided `Idempotency-Key` |
+| `request_hash` | `TEXT` | Hash of canonical mutation payload |
+| `state` | `TEXT` | `in_progress` or `completed` |
+| `response_status` | `INT` | Stored HTTP response status for successful mutation |
+| `response_body` | `JSONB` | Stored successful response body |
+| `created_at` | `TIMESTAMPTZ` | |
+| `updated_at` | `TIMESTAMPTZ` | |
+| `completed_at` | `TIMESTAMPTZ` | Set when response is persisted |
+
+Primary key: `(scope, key)`.
+
 ---
 
 ## 5. Temporal Workflow Design
@@ -134,6 +152,17 @@ Temporal may retry activities after timeout or worker failure. Activities are sa
 - `AddLineItemActivity`: first checks `line_items.id`. If same bill/payload already exists, returns success even if bill is now closed. If not present, locks bill row, verifies `open`, then inserts with `ON CONFLICT DO NOTHING`.
 - `CloseBillActivity`: locks bill row. If already `closed`, returns stored `total_amount`. If `open`, computes total and updates with `WHERE status = 'open'`; a lost update race falls back to stored total.
 
+### User-Facing Idempotency
+
+`POST /bills` and `POST /bills/:id/line-items` accept optional `Idempotency-Key` headers to protect client/API retries. Requests without a key preserve normal behavior: repeated calls create distinct bills or line items.
+
+- Keys are scoped by mutation/resource (`create_bill`, `add_line_item:<bill_id>`), so the same key can be reused safely outside its scope.
+- Same scoped key + same canonical payload returns the original successful response without creating a duplicate bill/item.
+- Same scoped key + different payload returns `409 Conflict`.
+- Only successful mutations are cached. Validation errors, missing-resource errors, closed-bill errors for new keys, Temporal failures, and incomplete executions are not cached as successes.
+- In-progress records are never returned as successful responses; concurrent same-key requests wait/poll for completion or return an in-progress error.
+- Add-line-item replay checks idempotency storage before current bill status, so replaying a previously successful keyed add after bill close returns the original item response instead of `409`.
+
 ### State Integrity (two-layer guard)
 
 **Layer 1 — API handler**: Before signaling workflow, queries `SELECT status FROM bills WHERE id = $1`. If `closed` → 409 immediately. No signal sent.
@@ -166,6 +195,8 @@ Temporal may retry activities after timeout or worker failure. Activities are sa
 | Bill not found | 404 Not Found |
 | Add item to closed bill | 409 Conflict |
 | Close already-closed bill | 409 Conflict |
+| Same Idempotency-Key with different payload | 409 Conflict |
+| Idempotency request still in progress | 409 Conflict |
 | Temporal server unreachable | 500 Internal Server Error |
 
 ---
@@ -175,6 +206,8 @@ Temporal may retry activities after timeout or worker failure. Activities are sa
 ### Add Items to Closed Bill
 
 API handler queries bill status first. If closed → 409 immediately (~1ms). No Temporal signal sent.
+
+Exception: if `Idempotency-Key` matches a completed earlier add-item request with the same payload, the API returns the original item response before checking current bill status. This makes client retries safe after a bill closes.
 
 If a race exists (close signal sent moments before add signal, but workflow hasn't processed close yet), the activity's `FOR UPDATE` lock serializes: whichever acquires the row lock first wins. If close wins, add sees `status != 'open'` and fails.
 
