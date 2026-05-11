@@ -51,3 +51,38 @@
 
 ## In Progress
 - [ ] Verify: full integration test with Temporal running and Encore test DB permissions
+
+## Future Improvements
+- [ ] Step 9: Add idempotency storage
+  - Add `idempotency_records` migration
+  - Store scope, key, request hash, state, response status/body, timestamps
+  - Enforce `PRIMARY KEY (scope, key)`
+- [ ] Step 10: Add `Idempotency-Key` request support
+  - Accept header on `POST /bills`
+  - Accept header on `POST /bills/:id/line-items`
+  - Preserve no-key behavior: repeated requests create distinct bills/items
+- [ ] Step 11: Implement idempotency helper layer
+  - Scope keys by mutation/resource
+  - Hash canonical payloads
+  - Reserve `in_progress` records
+  - Replay completed same-hash responses
+  - Return `409 Conflict` for same key + different payload
+  - Never return incomplete records as success
+- [ ] Step 12: Wire create-bill idempotency
+  - Validate before idempotency record creation
+  - Cache only successful responses
+  - Retry same key/payload returns same bill/workflow response
+  - Concurrent same-key requests produce one bill/workflow
+- [ ] Step 13: Wire add-line-item idempotency
+  - Validate before idempotency record creation
+  - Replay completed response before closed-bill status check
+  - New key after close returns `409 Conflict`
+  - Concurrent same-key requests produce one line item
+- [ ] Step 14: Implement idempotency tests
+  - Unskip minimum regression set in `bill/idempotency_test.go`
+  - Cover create replay/conflict/validation/concurrency
+  - Cover add replay/conflict/replay-after-close/new-key-after-close/validation
+  - Cover storage and incomplete-record behavior
+- [ ] Step 15: Verify idempotency implementation
+  - Run `encore test ./...`
+  - Document Temporal/test DB prerequisites if environment blocks full run
