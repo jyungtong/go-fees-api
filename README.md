@@ -63,6 +63,10 @@ curl -s -X POST http://localhost:4000/bills/<BILL_ID>/close \
 
 Full details: [docs/system-design.md](docs/system-design.md)
 
+## Code Review
+
+Financial-systems audit findings are documented in [CODE_REVIEW.md](CODE_REVIEW.md).
+
 ## Testing
 
 ```bash
