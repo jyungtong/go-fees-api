@@ -65,7 +65,7 @@ Full details: [docs/system-design.md](docs/system-design.md)
 
 ## Code Review
 
-Financial-systems audit findings are documented in [CODE_REVIEW.md](CODE_REVIEW.md).
+Financial-systems audit findings are documented in [CODE_REVIEW.md](docs/CODE_REVIEW.md).
 
 ## Testing
 
