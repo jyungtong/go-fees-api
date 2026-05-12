@@ -33,16 +33,13 @@ func withIdempotency[T any](ctx context.Context, customerID, scope, key string, 
 	}
 
 	deadline := time.Now().Add(idempotencyPollTimeout)
+	repo := NewRepository(db)
 	for {
-		tag, err := db.Exec(ctx, `
-			INSERT INTO idempotency_records (customer_id, scope, key, request_hash, state)
-			VALUES ($1, $2, $3, $4, 'in_progress')
-			ON CONFLICT (customer_id, scope, key) DO NOTHING
-		`, customerID, scope, key, requestHash)
+		created, err := repo.TryCreateIdempotencyRecord(ctx, customerID, scope, key, requestHash)
 		if err != nil {
 			return nil, err
 		}
-		if tag.RowsAffected() == 1 {
+		if created {
 			return completeIdempotentMutation(ctx, customerID, scope, key, fn)
 		}
 
@@ -68,8 +65,7 @@ func withIdempotency[T any](ctx context.Context, customerID, scope, key string, 
 func completeIdempotentMutation[T any](ctx context.Context, customerID, scope, key string, fn func() (*T, error)) (*T, error) {
 	res, err := fn()
 	if err != nil {
-		_, deleteErr := db.Exec(ctx, `DELETE FROM idempotency_records WHERE customer_id = $1 AND scope = $2 AND key = $3`, customerID, scope, key)
-		if deleteErr != nil {
+		if deleteErr := NewRepository(db).DeleteIdempotencyRecord(ctx, customerID, scope, key); deleteErr != nil {
 			return nil, deleteErr
 		}
 		return nil, err
@@ -79,40 +75,29 @@ func completeIdempotentMutation[T any](ctx context.Context, customerID, scope, k
 	if err != nil {
 		return nil, err
 	}
-	_, err = db.Exec(ctx, `
-		UPDATE idempotency_records
-		SET state = 'completed', response_status = 200, response_body = $1, updated_at = now(), completed_at = now()
-		WHERE customer_id = $2 AND scope = $3 AND key = $4
-	`, body, customerID, scope, key)
-	if err != nil {
+	if err := NewRepository(db).CompleteIdempotencyRecord(ctx, customerID, scope, key, body); err != nil {
 		return nil, err
 	}
 	return res, nil
 }
 
 func replayIdempotentMutation[T any](ctx context.Context, customerID, scope, key, requestHash string) (*T, bool, error) {
-	var existingHash string
-	var state string
-	var body []byte
-	err := db.QueryRow(ctx, `
-		SELECT request_hash, state, response_body
-		FROM idempotency_records WHERE customer_id = $1 AND scope = $2 AND key = $3
-	`, customerID, scope, key).Scan(&existingHash, &state, &body)
+	record, err := NewRepository(db).GetIdempotencyRecord(ctx, customerID, scope, key)
 	if err != nil {
 		if isNoRows(err) {
 			return nil, false, nil
 		}
 		return nil, false, err
 	}
-	if existingHash != requestHash {
+	if record.RequestHash != requestHash {
 		return nil, false, errs.WrapCode(errors.New("same idempotency key used with different payload"), errs.Aborted, "idempotency_conflict")
 	}
-	if state != "completed" {
+	if record.State != "completed" {
 		return nil, false, nil
 	}
 
 	var res T
-	if err := json.Unmarshal(body, &res); err != nil {
+	if err := json.Unmarshal(record.Body, &res); err != nil {
 		return nil, false, err
 	}
 	return &res, true, nil

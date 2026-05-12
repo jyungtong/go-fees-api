@@ -57,6 +57,7 @@ curl -s -X POST http://localhost:4000/bills/<BILL_ID>/close \
 ## Key Design
 
 - **Temporal workflows** are the bill lifecycle — the workflow stays alive for the whole billing period, receiving line items as signals
+- **Repository layer** centralizes PostgreSQL access — API handlers and Temporal activities do not embed SQL directly
 - **Multi-tenant** via `customer-id` header — all queries scoped by tenant, cross-tenant access returns `404`
 - **Idempotency** via optional `Idempotency-Key` header — safe retries for bill creation and line item additions
 
@@ -76,6 +77,10 @@ encore test ./...
 
 ```bash
 BASE_URL=http://localhost:4000 CUSTOMER_ID=my-tenant ./verify.sh
+
+# Use a unique tenant when rerunning against a persistent local DB, because
+# verify.sh uses fixed idempotency keys for replay assertions.
+CUSTOMER_ID="smoke-$(date +%s)" ./verify.sh
 ```
 
 ## Environment Variables

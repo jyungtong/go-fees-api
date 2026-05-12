@@ -20,9 +20,15 @@ A billing service that tracks progressive fee accrual over a billing period. Lin
                        │                   │
                        ▼                   ▼
                ┌──────────────┐     ┌────────────┐
-               │ PostgreSQL   │◀────│ Activities │
-               │ (bills,      │     │ (DB ops)   │
-               │  line_items) │     └────────────┘
+               │ Repository   │◀────│ Activities │
+               │ (SQL + TX)   │     │            │
+               └──────┬───────┘     └────────────┘
+                      ▼
+               ┌──────────────┐
+               │ PostgreSQL   │
+               │ (bills,      │
+               │  line_items, │
+               │  idempotency)│
                └──────────────┘
 ```
 
@@ -31,7 +37,21 @@ A billing service that tracks progressive fee accrual over a billing period. Lin
 | **Encore** | Service framework, API layer, DI, auto-provisioning |
 | **Temporal** | Long-running workflow engine. Workflow = bill lifecycle |
 | **PostgreSQL** | Persistent state (bills, line items, idempotency records). Accessed via Encore `sqldb` |
-| **Activities** | Side-effect-free DB operations called by workflow |
+| **Repository** | Concrete DB access layer. Owns SQL, row mapping, and transactions |
+| **Activities** | Workflow side effects called by Temporal. Delegate persistence to repository |
+
+### Repository Layer
+
+`bill/repository.go` centralizes database access behind a concrete `Repository` type. It uses Encore `sqldb` directly and owns all SQL statements, row scans, and transaction boundaries.
+
+The service does not define broad repository interfaces yet. This keeps the Go code simple: add interfaces only when there is a concrete need, such as mocked unit tests or a second storage implementation.
+
+Responsibilities stay split:
+
+- API handlers validate requests, enforce tenant context, map errors to Encore codes, call Temporal, and shape responses.
+- Workflows coordinate bill lifecycle and signals.
+- Activities represent Temporal side effects and call repository methods.
+- Repository persists and reads bills, line items, and idempotency records.
 
 ---
 
@@ -157,9 +177,9 @@ Primary key: `(customer_id, scope, key)`.
 
 | Activity | Operation |
 |----------|-----------|
-| `CreateBillActivity` | INSERT into `bills` |
-| `AddLineItemActivity` | INSERT into `line_items` (inside TX with status check) |
-| `CloseBillActivity` | `SELECT SUM` + `UPDATE bills SET status=closed` (inside TX) |
+| `CreateBillActivity` | Calls `Repository.InsertBill` |
+| `AddLineItemActivity` | Calls `Repository.AddLineItem` for idempotent insert inside TX with status check |
+| `CloseBillActivity` | Calls `Repository.CloseBill` for `SELECT SUM` + `UPDATE bills SET status=closed` inside TX |
 
 ### Activity Idempotency
 
@@ -182,9 +202,9 @@ Temporal may retry activities after timeout or worker failure. Activities are sa
 
 ### State Integrity (two-layer guard)
 
-**Layer 1 — API handler**: Before signaling workflow, queries `SELECT status FROM bills WHERE id = $1`. If `closed` → 409 immediately. No signal sent.
+**Layer 1 — API handler**: Before signaling workflow, queries current bill status through repository. If `closed` → 409 immediately. No signal sent.
 
-**Layer 2 — Activity**: Inside a transaction with `SELECT ... FOR UPDATE`. If status has changed to `closed` since layer 1 → activity returns error, workflow logs and skips.
+**Layer 2 — Activity/repository**: Repository runs the activity's transaction with `SELECT ... FOR UPDATE`. If status has changed to `closed` since layer 1 → activity returns error, workflow logs and skips.
 
 ---
 
@@ -265,3 +285,14 @@ encore run
 ```
 
 Service available at `http://localhost:4000`.
+
+Run tests and smoke checks:
+
+```bash
+# Package tests through Encore runtime
+encore test ./bill
+
+# Smoke test against running service. Use unique CUSTOMER_ID for repeat runs
+# against a persistent local DB because script idempotency keys are fixed.
+CUSTOMER_ID="smoke-$(date +%s)" ./verify.sh
+```
